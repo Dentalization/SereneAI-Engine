@@ -14,6 +14,7 @@ import streamlit as st
 
 from src.agents.orchestrator import run_agent
 from src.tools.yolo_tool import detect_issues
+import threading
 
 
 @st.cache_resource
@@ -41,6 +42,35 @@ def get_db_connection() -> sqlite3.Connection:
     return init_db()
 
 
+@st.cache_resource
+def warmup_resources() -> bool:
+    """Warm up heavy resources in a background thread without blocking UI."""
+    def _warm():
+        try:
+            logging.info("WARMUP: Starting background warmup")
+            # Lazy imports to avoid overhead on module import
+            from src.tools.rag_tool import setup_rag
+            from src.tools.yolo_tool import load_yolo_model
+            from src.utils.llm import get_gemini_chat
+            from langchain_core.messages import HumanMessage
+
+            # Preload vectorstore/KG
+            setup_rag()
+            # Preload YOLO
+            load_yolo_model()
+            # Prewarm Gemini
+            try:
+                _ = get_gemini_chat(temperature=0).invoke([HumanMessage(content="ping")])
+            except Exception:
+                pass
+            logging.info("WARMUP: Completed")
+        except Exception as e:
+            logging.warning(f"WARMUP: Failed {e}")
+
+    threading.Thread(target=_warm, daemon=True).start()
+    return True
+
+
 def render_chat_interface(config: Dict[str, Any]) -> None:
     """Render the main chat interface and handle events.
 
@@ -48,6 +78,8 @@ def render_chat_interface(config: Dict[str, Any]) -> None:
         config: Global runtime configuration from src.config.load_config().
     """
     logging.info("UI: Rendering chat interface")
+    # Kick off background warmup
+    warmup_resources()
     conn = get_db_connection()
 
     if "messages" not in st.session_state:

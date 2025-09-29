@@ -37,6 +37,13 @@ def load_config() -> Dict[str, Any]:
         "max_file_size_mb": 5,
         # Cache size used by RAG LRU cache.
         "cache_size": 100,
+        # RAG controls
+        "enable_pubmed": os.getenv("ENABLE_PUBMED", "false").lower() == "true",
+        "embedding_model": os.getenv(
+            "EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
+        ),
+        "rag_index_dir": os.getenv("RAG_INDEX_DIR", ".rag/faiss_index"),
+        "kg_path": os.getenv("KG_PATH", ".rag/kg.pkl"),
         # Detection classes and colors (BGR) for visualization.
         "classes": [
             "calculus",
@@ -69,6 +76,8 @@ def setup_logging() -> None:
 
     The logger writes to both stdout and app.log with rotation.
     """
+    if getattr(setup_logging, "_initialized", False):
+        return
     log_level = os.getenv("LOG_LEVEL", "INFO").upper()  # DEBUG/INFO/WARNING/...
     level = getattr(logging, log_level, logging.INFO)
     logging.basicConfig(
@@ -77,5 +86,13 @@ def setup_logging() -> None:
     )
     handler = RotatingFileHandler("app.log", maxBytes=1_000_000, backupCount=5)
     handler.setLevel(level)
-    logging.getLogger().addHandler(handler)
+    root_logger = logging.getLogger()
+    # Avoid duplicate handlers if Streamlit reruns
+    if not any(isinstance(h, RotatingFileHandler) for h in root_logger.handlers):
+        root_logger.addHandler(handler)
+    # Reduce noisy third-party logs
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("transformers").setLevel(logging.WARNING)
+    logging.getLogger("faiss").setLevel(logging.WARNING)
     logging.info(f"Logging setup with level: {log_level}")
+    setattr(setup_logging, "_initialized", True)

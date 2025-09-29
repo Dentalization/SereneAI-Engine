@@ -23,6 +23,8 @@ from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 
 from src.config import load_config
+import os
+import pickle
 from src.utils.llm import get_gemini_chat
 
 config = load_config()
@@ -109,10 +111,44 @@ def query_graph(query: str, graph: nx.DiGraph) -> str:
 
 
 def setup_rag() -> None:
-    """Initialize retrievers, vectorstore, and knowledge graph once per process."""
+    """Initialize retrievers, vectorstore, and knowledge graph once per process.
+
+    Attempts to load persisted FAISS index and KG from disk. If not found,
+    builds them and persists for future runs.
+    """
     global vectorstore, retriever, knowledge_graph
+    if vectorstore is not None:
+        return
+
+    os.makedirs(os.path.dirname(config["kg_path"]) or ".", exist_ok=True)
+    index_dir = config["rag_index_dir"]
+
+    logging.info("RAG: Starting setup...")
+
+    # Prepare embeddings up front (used for load or build)
+    model_name = config["embedding_model"]
+    try:
+        embeddings = HuggingFaceEmbeddings(model_name=model_name)
+        logging.info(f"RAG: Embeddings loaded: {model_name}")
+    except Exception as e:
+        logging.warning(f"RAG: Embedding fallback from {model_name}: {e} -> all-MiniLM-L6-v2")
+        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+    # Try load persisted index and KG
+    try:
+        if os.path.isdir(index_dir):
+            vectorstore = FAISS.load_local(index_dir, embeddings, allow_dangerous_deserialization=True)
+            logging.info(f"RAG: Loaded FAISS index from {index_dir}")
+        if os.path.exists(config["kg_path"]):
+            with open(config["kg_path"], "rb") as f:
+                knowledge_graph = pickle.load(f)
+            logging.info(f"RAG: Loaded KG from {config['kg_path']}")
+    except Exception as e:
+        logging.warning(f"RAG: Failed to load persisted index/KG: {e}")
+        vectorstore = None
+        knowledge_graph = None
+
     if vectorstore is None:
-        logging.info("RAG: Starting setup...")
         loader = PyPDFDirectoryLoader(config["docs_path"])
         docs = loader.load()
         # Enhanced metadata for PDF (page, filename)
@@ -121,51 +157,38 @@ def setup_rag() -> None:
             doc.metadata["page"] = doc.metadata.get("page", 1)
             doc.metadata["title"] = os.path.basename(doc.metadata.get("source", "Unknown"))
         logging.info(f"RAG: Loaded {len(docs)} PDF docs with page metadata")
-        try:
-            pubmed_loader = PubMedLoader("dental conditions caries gingivitis Indonesia")
-            pubmed_docs = pubmed_loader.load()
-            # PubMed (sama, enhanced)
-            if pubmed_docs:
-                for i, doc in enumerate(pubmed_docs):
-                    doc.metadata["source"] = f"PubMed_{i + 1}"
-                    doc.metadata["title"] = doc.metadata.get("Title", "PubMed Article")
-                    doc.metadata["authors"] = doc.metadata.get("Authors", "Unknown")
-                    doc.metadata["pmid"] = doc.metadata.get("PMID", "N/A")
-                docs.extend(pubmed_docs)
-                logging.info(f"RAG: Loaded {len(pubmed_docs)} PubMed docs with metadata")
-            else:
-                logging.warning("RAG: No PubMed docs; using PDF only.")
-        except Exception as e:
-            logging.warning(f"RAG: PubMed load error: {e}. Using PDF only.")
+        # Conditionally load PubMed
+        if config["enable_pubmed"]:
+            try:
+                pubmed_loader = PubMedLoader("dental conditions caries gingivitis Indonesia")
+                pubmed_docs = pubmed_loader.load()
+                if pubmed_docs:
+                    for i, doc in enumerate(pubmed_docs):
+                        doc.metadata["source"] = f"PubMed_{i + 1}"
+                        doc.metadata["title"] = doc.metadata.get("Title", "PubMed Article")
+                        doc.metadata["authors"] = doc.metadata.get("Authors", "Unknown")
+                        doc.metadata["pmid"] = doc.metadata.get("PMID", "N/A")
+                    docs.extend(pubmed_docs)
+                    logging.info(f"RAG: Loaded {len(pubmed_docs)} PubMed docs with metadata")
+                else:
+                    logging.warning("RAG: No PubMed docs; using PDF only.")
+            except Exception as e:
+                logging.warning(f"RAG: PubMed load error: {e}. Using PDF only.")
         splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
         texts = splitter.split_documents(docs)
         logging.info(f"RAG: Split into {len(texts)} chunks")
-        try:
-            embeddings = HuggingFaceEmbeddings(model_name="dmis-lab/biobert-base-cased-v1.1")
-            logging.info("RAG: BioBERT embeddings loaded successfully.")
-        except Exception as e:
-            logging.warning(f"RAG: BioBERT fallback: {e}.")
-            embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-        vectorstore = FAISS.from_documents(texts, embeddings)
-        semantic_retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
-        bm25_retriever = None
-        if importlib.util.find_spec("rank_bm25"):
-            bm25_retriever = BM25Retriever.from_documents(texts)
-        if bm25_retriever:
-            ensemble_retriever = EnsembleRetriever(
-                retrievers=[bm25_retriever, semantic_retriever], weights=[0.4, 0.6]
-            )
-        else:
-            ensemble_retriever = semantic_retriever
-        cross_encoder = HuggingFaceCrossEncoder(model_name="cross-encoder/ms-marco-MiniLM-L-6-v2")
-        compressor = CrossEncoderReranker(model=cross_encoder, top_n=3)
-        retriever = ContextualCompressionRetriever(
-            base_compressor=compressor, base_retriever=ensemble_retriever
-        )
-        llm = get_gemini_chat(model="gemini-2.5-flash", temperature=0)
-        # Create chain for triple extraction
-        from langchain_core.output_parsers import StrOutputParser
 
+        vectorstore = FAISS.from_documents(texts, embeddings)
+        # Persist index to disk
+        try:
+            vectorstore.save_local(index_dir)
+            logging.info(f"RAG: Saved FAISS index to {index_dir}")
+        except Exception as e:
+            logging.warning(f"RAG: Failed to persist FAISS index: {e}")
+
+        # Build KG from sampled docs (limited for cost)
+        llm = get_gemini_chat(model="gemini-2.5-flash", temperature=0)
+        from langchain_core.output_parsers import StrOutputParser
         triple_chain = KNOWLEDGE_TRIPLE_EXTRACTION_PROMPT | llm | StrOutputParser()
         all_triples: List[Tuple[str, str, str]] = []
         for text_doc in texts[:10]:
@@ -175,7 +198,31 @@ def setup_rag() -> None:
             except Exception as e:  # noqa: BLE001
                 logging.error(f"RAG: Triple extraction error: {e}")
         knowledge_graph = create_graph_from_triples(all_triples)
-        logging.info("RAG: Setup complete")
+        try:
+            with open(config["kg_path"], "wb") as f:
+                pickle.dump(knowledge_graph, f)
+            logging.info(f"RAG: Saved KG to {config['kg_path']}")
+        except Exception as e:
+            logging.warning(f"RAG: Failed to persist KG: {e}")
+
+    # Build retriever wrapper (regardless of load/build)
+    semantic_retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+    bm25_retriever = None
+    if importlib.util.find_spec("rank_bm25"):
+        bm25_retriever = BM25Retriever.from_documents(vectorstore.docstore._dict.values())  # type: ignore[attr-defined]
+    if bm25_retriever:
+        ensemble_retriever = EnsembleRetriever(
+            retrievers=[bm25_retriever, semantic_retriever], weights=[0.4, 0.6]
+        )
+    else:
+        ensemble_retriever = semantic_retriever
+    cross_encoder = HuggingFaceCrossEncoder(model_name="cross-encoder/ms-marco-MiniLM-L-6-v2")
+    compressor = CrossEncoderReranker(model=cross_encoder, top_n=3)
+    retriever = ContextualCompressionRetriever(
+        base_compressor=compressor, base_retriever=ensemble_retriever
+    )
+
+    logging.info("RAG: Setup complete")
 
 
 def route_query(query: str, detections: str = "", spatial_insights: str = "") -> str:

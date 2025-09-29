@@ -19,10 +19,13 @@ from ultralytics import YOLO
 
 from src.config import load_config
 from src.utils.llm import get_gemini_chat
+from cachetools import LRUCache
+import hashlib
 
 config = load_config()
 _model = None  # Lazily initialized YOLO model
 _gemini_vision = None  # Lazily initialized Gemini client with vision support
+_spatial_cache: LRUCache = LRUCache(maxsize=64)
 
 
 def _get_gemini_vision():
@@ -81,9 +84,15 @@ def validate_image(image_path: str) -> bool:
 def get_spatial_insights(image_path: str, detections: List[Dict[str, Any]]) -> str:
     """Use Gemini for enhanced spatial analysis on YOLO outputs via LangChain."""
     try:
-        # Read and encode image to base64
+        # Cache key: content hash of image + detections
         with open(image_path, "rb") as image_file:
-            image_data = base64.b64encode(image_file.read()).decode("utf-8")
+            img_bytes = image_file.read()
+        key = (hashlib.sha1(img_bytes).hexdigest(), json.dumps(detections, sort_keys=True))
+        if key in _spatial_cache:
+            return _spatial_cache[key]
+
+        # Read and encode image to base64
+        image_data = base64.b64encode(img_bytes).decode("utf-8")
 
         # Format prompt with detections
         prompt = config["gemini_spatial_prompt"].format(
@@ -103,6 +112,7 @@ def get_spatial_insights(image_path: str, detections: List[Dict[str, Any]]) -> s
 
         # Invoke model with vision capabilities
         response = _get_gemini_vision().invoke([message])
+        _spatial_cache[key] = response.content
         return response.content
     except Exception as e:  # noqa: BLE001 - degrade gracefully
         logging.error(f"Gemini spatial error: {str(e)}")
@@ -119,7 +129,9 @@ def detect_issues(image_path: str, threshold: float | None = None) -> Tuple[str,
         validate_image(image_path)
         img = preprocess_image(image_path)
         model = load_yolo_model()
-        results = model(img)[0]
+        # Inference mode for faster eval
+        with torch.inference_mode():
+            results = model(img)[0]
         detections: List[Dict[str, Any]] = []
         for result in results.boxes:
             conf = result.conf.item()
