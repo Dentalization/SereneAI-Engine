@@ -169,35 +169,40 @@ def render_chat_interface(config: Dict[str, Any]) -> None:
 
                 # Transparansi: Tampilkan sources jika ada
                 if sources:
+                    # Count by provider for header
+                    pdf_count = len([s for s in sources if s.get('provider') == 'PDF'])
+                    pubmed_count = len([s for s in sources if s.get('provider') == 'PubMed'])
                     with st.expander("📚 Sources (RAG Context)", expanded=False):
                         st.markdown(
-                            f"**Retrieved {len(sources)} sources:** {len([s for s in sources if 'PDF' in s['source']])} PDF, {len([s for s in sources if 'PubMed' in s['source']])} PubMed"
+                            f"**Retrieved {len(sources)} sources:** {pdf_count} PDF, {pubmed_count} PubMed"
                         )
                         for src in sources:
-                            col1, col2 = st.columns([3, 1])
-                            with col1:
-                                if "PubMed" in src["source"]:
-                                    st.markdown(
-                                        f"**Source {src['id']} (PubMed):** {src['title']}"
-                                    )
-                                    if src["authors"]:
-                                        st.caption(f"Authors: {src['authors']}")
-                                    if src["pmid"]:
-                                        st.caption(
-                                            f"PMID: [ {src['pmid']} ](https://pubmed.ncbi.nlm.nih.gov/{src['pmid']}/)"
-                                        )
+                            provider = src.get("provider", "")
+                            title = src.get("title", "Unknown")
+                            snippet = src.get("snippet", "")
+                            page = src.get("page", "")
+                            with st.container(border=True):
+                                if provider == "PubMed":
+                                    pmid = src.get("pmid", "")
+                                    url = src.get("url") or (f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else "")
+                                    st.markdown(f"**Source {src['id']} (PubMed):** {title}")
+                                    meta = []
+                                    if src.get("authors"):
+                                        meta.append(f"Authors: {src['authors']}")
+                                    if pmid:
+                                        meta.append(f"PMID: [ {pmid} ]({url})")
+                                    if meta:
+                                        st.caption(" | ".join(meta))
+                                    st.caption(snippet)
                                 else:
+                                    # PDF source
                                     st.markdown(
-                                        f"**Source {src['id']} (PDF):** {src['title']} (Page {src['page']})"
+                                        f"**Source {src['id']} (PDF):** {title}{f' (Page {page})' if page else ''}"
                                     )
-                            with col2:
-                                if "PubMed" in src["source"]:
-                                    st.image(
-                                        "https://cdn.ncbi.nlm.nih.gov/coreutils/nwds/img/favicons/favicon.png",
-                                        width=50,
-                                    )  # PubMed icon
-                            st.caption(src["snippet"])
-                            st.markdown("---")
+                                    spath = src.get("source_path", "")
+                                    if spath:
+                                        st.caption(f"Path: {spath}")
+                                    st.caption(snippet)
                         logging.debug(
                             f"UI: Displayed {len(sources)} sources in expander"
                         )

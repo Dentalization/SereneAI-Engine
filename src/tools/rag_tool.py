@@ -117,99 +117,124 @@ def setup_rag() -> None:
     builds them and persists for future runs.
     """
     global vectorstore, retriever, knowledge_graph
-    if vectorstore is not None:
-        return
 
     os.makedirs(os.path.dirname(config["kg_path"]) or ".", exist_ok=True)
     index_dir = config["rag_index_dir"]
 
     logging.info("RAG: Starting setup...")
 
-    # Prepare embeddings up front (used for load or build)
-    model_name = config["embedding_model"]
-    try:
-        embeddings = HuggingFaceEmbeddings(model_name=model_name)
-        logging.info(f"RAG: Embeddings loaded: {model_name}")
-    except Exception as e:
-        logging.warning(f"RAG: Embedding fallback from {model_name}: {e} -> all-MiniLM-L6-v2")
-        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    # If vectorstore already exists but retriever/KG are missing, we still need to proceed
+    need_build_index = vectorstore is None
 
-    # Try load persisted index and KG
-    try:
-        if os.path.isdir(index_dir):
-            vectorstore = FAISS.load_local(index_dir, embeddings, allow_dangerous_deserialization=True)
-            logging.info(f"RAG: Loaded FAISS index from {index_dir}")
-        if os.path.exists(config["kg_path"]):
-            with open(config["kg_path"], "rb") as f:
-                knowledge_graph = pickle.load(f)
-            logging.info(f"RAG: Loaded KG from {config['kg_path']}")
-    except Exception as e:
-        logging.warning(f"RAG: Failed to load persisted index/KG: {e}")
-        vectorstore = None
-        knowledge_graph = None
+    embeddings = None
+    if need_build_index:
+        # Prepare embeddings up front (used for load or build)
+        model_name = config["embedding_model"]
+        try:
+            embeddings = HuggingFaceEmbeddings(model_name=model_name)
+            logging.info(f"RAG: Embeddings loaded: {model_name}")
+        except Exception as e:
+            logging.warning(f"RAG: Embedding fallback from {model_name}: {e} -> all-MiniLM-L6-v2")
+            embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
-    if vectorstore is None:
-        loader = PyPDFDirectoryLoader(config["docs_path"])
-        docs = loader.load()
-        # Enhanced metadata for PDF (page, filename)
-        for doc in docs:
-            doc.metadata["source"] = doc.metadata.get("source", "PDF")  # Filename from source
-            doc.metadata["page"] = doc.metadata.get("page", 1)
-            doc.metadata["title"] = os.path.basename(doc.metadata.get("source", "Unknown"))
-        logging.info(f"RAG: Loaded {len(docs)} PDF docs with page metadata")
-        # Conditionally load PubMed
-        if config["enable_pubmed"]:
+        # Try load persisted index and KG
+        try:
+            if os.path.isdir(index_dir):
+                vectorstore = FAISS.load_local(index_dir, embeddings, allow_dangerous_deserialization=True)
+                logging.info(f"RAG: Loaded FAISS index from {index_dir}")
+            if os.path.exists(config["kg_path"]):
+                with open(config["kg_path"], "rb") as f:
+                    knowledge_graph = pickle.load(f)
+                logging.info(f"RAG: Loaded KG from {config['kg_path']}")
+        except Exception as e:
+            logging.warning(f"RAG: Failed to load persisted index/KG: {e}")
+            vectorstore = None
+            knowledge_graph = None
+
+        if vectorstore is None:
+            loader = PyPDFDirectoryLoader(config["docs_path"])
+            docs = loader.load()
+            # Enhanced metadata for PDF (page, filename, provider)
+            for doc in docs:
+                src_path = doc.metadata.get("source", "")
+                doc.metadata["provider"] = "PDF"
+                doc.metadata["source_path"] = src_path
+                doc.metadata["page"] = doc.metadata.get("page", 1)
+                if not doc.metadata.get("title"):
+                    doc.metadata["title"] = os.path.basename(src_path) if src_path else "Unknown"
+            logging.info(f"RAG: Loaded {len(docs)} PDF docs with page metadata")
+            # Conditionally load PubMed
+            if config["enable_pubmed"]:
+                try:
+                    pubmed_loader = PubMedLoader("dental conditions caries gingivitis Indonesia")
+                    pubmed_docs = pubmed_loader.load()
+                    if pubmed_docs:
+                        for i, doc in enumerate(pubmed_docs):
+                            doc.metadata["provider"] = "PubMed"
+                            doc.metadata["title"] = doc.metadata.get("Title", "PubMed Article")
+                            doc.metadata["authors"] = doc.metadata.get("Authors", "Unknown")
+                            doc.metadata["pmid"] = doc.metadata.get("PMID", "")
+                            doc.metadata["url"] = (
+                                f"https://pubmed.ncbi.nlm.nih.gov/{doc.metadata['pmid']}/" if doc.metadata.get("PMID") else ""
+                            )
+                        docs.extend(pubmed_docs)
+                        logging.info(f"RAG: Loaded {len(pubmed_docs)} PubMed docs with metadata")
+                    else:
+                        logging.warning("RAG: No PubMed docs; using PDF only.")
+                except Exception as e:
+                    logging.warning(f"RAG: PubMed load error: {e}. Using PDF only.")
+            splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+            texts = splitter.split_documents(docs)
+            logging.info(f"RAG: Split into {len(texts)} chunks")
+
+            vectorstore = FAISS.from_documents(texts, embeddings)
+            # Persist index to disk
             try:
-                pubmed_loader = PubMedLoader("dental conditions caries gingivitis Indonesia")
-                pubmed_docs = pubmed_loader.load()
-                if pubmed_docs:
-                    for i, doc in enumerate(pubmed_docs):
-                        doc.metadata["source"] = f"PubMed_{i + 1}"
-                        doc.metadata["title"] = doc.metadata.get("Title", "PubMed Article")
-                        doc.metadata["authors"] = doc.metadata.get("Authors", "Unknown")
-                        doc.metadata["pmid"] = doc.metadata.get("PMID", "N/A")
-                    docs.extend(pubmed_docs)
-                    logging.info(f"RAG: Loaded {len(pubmed_docs)} PubMed docs with metadata")
-                else:
-                    logging.warning("RAG: No PubMed docs; using PDF only.")
+                vectorstore.save_local(index_dir)
+                logging.info(f"RAG: Saved FAISS index to {index_dir}")
             except Exception as e:
-                logging.warning(f"RAG: PubMed load error: {e}. Using PDF only.")
-        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        texts = splitter.split_documents(docs)
-        logging.info(f"RAG: Split into {len(texts)} chunks")
+                logging.warning(f"RAG: Failed to persist FAISS index: {e}")
 
-        vectorstore = FAISS.from_documents(texts, embeddings)
-        # Persist index to disk
-        try:
-            vectorstore.save_local(index_dir)
-            logging.info(f"RAG: Saved FAISS index to {index_dir}")
-        except Exception as e:
-            logging.warning(f"RAG: Failed to persist FAISS index: {e}")
-
-        # Build KG from sampled docs (limited for cost)
-        llm = get_gemini_chat(model="gemini-2.5-flash", temperature=0)
-        from langchain_core.output_parsers import StrOutputParser
-        triple_chain = KNOWLEDGE_TRIPLE_EXTRACTION_PROMPT | llm | StrOutputParser()
-        all_triples: List[Tuple[str, str, str]] = []
-        for text_doc in texts[:10]:
+            # Build KG from sampled docs (limited for cost)
+            llm = get_gemini_chat(model="gemini-2.5-flash", temperature=0)
+            from langchain_core.output_parsers import StrOutputParser
+            triple_chain = KNOWLEDGE_TRIPLE_EXTRACTION_PROMPT | llm | StrOutputParser()
+            all_triples: List[Tuple[str, str, str]] = []
+            for text_doc in texts[:10]:
+                try:
+                    triples_str = triple_chain.invoke({"text": text_doc.page_content})
+                    all_triples.extend(parse_triples(triples_str))
+                except Exception as e:  # noqa: BLE001
+                    logging.error(f"RAG: Triple extraction error: {e}")
+            knowledge_graph = create_graph_from_triples(all_triples)
             try:
-                triples_str = triple_chain.invoke({"text": text_doc.page_content})
-                all_triples.extend(parse_triples(triples_str))
-            except Exception as e:  # noqa: BLE001
-                logging.error(f"RAG: Triple extraction error: {e}")
-        knowledge_graph = create_graph_from_triples(all_triples)
-        try:
-            with open(config["kg_path"], "wb") as f:
-                pickle.dump(knowledge_graph, f)
-            logging.info(f"RAG: Saved KG to {config['kg_path']}")
-        except Exception as e:
-            logging.warning(f"RAG: Failed to persist KG: {e}")
+                with open(config["kg_path"], "wb") as f:
+                    pickle.dump(knowledge_graph, f)
+                logging.info(f"RAG: Saved KG to {config['kg_path']}")
+            except Exception as e:
+                logging.warning(f"RAG: Failed to persist KG: {e}")
+    else:
+        # If vectorstore exists but KG missing, try load KG from disk
+        if knowledge_graph is None and os.path.exists(config["kg_path"]):
+            try:
+                with open(config["kg_path"], "rb") as f:
+                    knowledge_graph = pickle.load(f)
+                logging.info(f"RAG: Loaded KG from {config['kg_path']}")
+            except Exception as e:
+                logging.warning(f"RAG: Failed to load KG: {e}")
 
-    # Build retriever wrapper (regardless of load/build)
+    # Build retriever wrapper (always ensure retriever exists)
+    if vectorstore is None:
+        raise RuntimeError("RAG: vectorstore not initialized")
+
     semantic_retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
     bm25_retriever = None
-    if importlib.util.find_spec("rank_bm25"):
-        bm25_retriever = BM25Retriever.from_documents(vectorstore.docstore._dict.values())  # type: ignore[attr-defined]
+    if importlib.util.find_spec("rank_bm25") and hasattr(vectorstore, "docstore"):
+        try:
+            bm25_retriever = BM25Retriever.from_documents(list(vectorstore.docstore._dict.values()))  # type: ignore[attr-defined]
+        except Exception as e:
+            logging.warning(f"RAG: BM25 retriever unavailable: {e}")
+            bm25_retriever = None
     if bm25_retriever:
         ensemble_retriever = EnsembleRetriever(
             retrievers=[bm25_retriever, semantic_retriever], weights=[0.4, 0.6]
@@ -245,6 +270,14 @@ def route_query(query: str, detections: str = "", spatial_insights: str = "") ->
         return "vector"
 
 
+def _safe_log(text: str) -> str:
+    """Sanitize text for Windows console logging to avoid UnicodeEncodeError."""
+    try:
+        return text.encode("ascii", "ignore").decode("ascii")
+    except Exception:
+        return "".join(ch for ch in text if ord(ch) < 128)
+
+
 def query_rag(
     query: str,
     detections: str = "",
@@ -277,32 +310,30 @@ def query_rag(
         # Extract sources metadata
         sources: List[Dict] = []
         for i, doc in enumerate(docs):
+            provider = doc.metadata.get("provider", "")
             source_info = {
                 "id": i + 1,
                 "title": doc.metadata.get("title", "Unknown"),
-                "source": doc.metadata.get("source", "Unknown"),
-                "page": doc.metadata.get("page", "N/A")
-                if "PDF" in doc.metadata.get("source", "")
-                else "N/A",
-                "authors": doc.metadata.get("authors", "")
-                if "PubMed" in doc.metadata.get("source", "")
-                else "",
-                "pmid": doc.metadata.get("pmid", "")
-                if "PubMed" in doc.metadata.get("source", "")
-                else "",
-                "snippet": doc.page_content[:200] + "..."
-                if len(doc.page_content) > 200
-                else doc.page_content,
+                "provider": provider or ("PubMed" if doc.metadata.get("pmid") else "PDF"),
+                "source_path": doc.metadata.get("source_path", doc.metadata.get("source", "")),
+                "url": doc.metadata.get("url", ""),
+                "page": doc.metadata.get("page", "") if provider == "PDF" else "",
+                "authors": doc.metadata.get("authors", "") if provider == "PubMed" else "",
+                "pmid": doc.metadata.get("pmid", "") if provider == "PubMed" else "",
+                "snippet": doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content,
             }
             sources.append(source_info)
-        pdf_count = len([s for s in sources if "PDF" in s["source"]])
-        pubmed_count = len([s for s in sources if "PubMed" in s["source"]])
+        pdf_count = len([s for s in sources if s.get("provider") == "PDF"])
+        pubmed_count = len([s for s in sources if s.get("provider") == "PubMed"])
         logging.info(
             f"RAG: Retrieved {len(docs)} docs (PDF: {pdf_count}, PubMed: {pubmed_count})"
         )
         for src in sources:
+            safe_snip = _safe_log(src.get("snippet", ""))
+            safe_title = _safe_log(src.get("title", ""))
+            safe_src = _safe_log(src.get("source_path", src.get("url", "")))
             logging.debug(
-                f"RAG: Source {src['id']}: {src['title']} ({src['source']}) - Snippet: {src['snippet'][:100]}..."
+                f"RAG: Source {src['id']}: {safe_title} ({safe_src}) - Snippet: {safe_snip[:100]}..."
             )
     except Exception as e:
         logging.error(f"RAG: Retrieval error: {e}")
