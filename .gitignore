@@ -203,3 +203,11 @@ output_*
 
 # Dependencies that might be downloaded locally
 requirements-dev.txt
+
+# RAG persisted index and graph
+.rag/
+
+# Temp uploads
+temp_*.jpg
+temp_*.jpeg
+temp_*.png
