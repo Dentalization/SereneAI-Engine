@@ -1,10 +1,15 @@
-"""Semantic chunking using sentence embeddings and clustering.
+"""Semantic chunking using sentence embeddings and similarity thresholds.
 
 Instead of fixed-size chunks, this creates chunks based on semantic coherence:
-- Group semantically similar sentences together
+- Group semantically similar sentences together using cosine similarity
 - Respect natural document boundaries
 - Maintain context with overlapping boundaries
 - Add provenance tracking for each chunk
+
+Optimized for performance:
+- Uses threshold-based chunking (O(n)) instead of clustering (O(n²))
+- Shared embedding model via centralized singleton
+- Faster startup and lower memory footprint
 """
 from __future__ import annotations
 
@@ -17,7 +22,9 @@ import numpy as np
 from langchain_core.documents import Document
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
-from sklearn.cluster import AgglomerativeClustering
+from sklearn.metrics.pairwise import cosine_similarity
+
+from src.utils.embeddings import get_sentence_transformer
 
 logger = logging.getLogger(__name__)
 
@@ -42,21 +49,28 @@ class SemanticChunk(BaseModel):
 
 
 class SemanticChunker:
-    """Creates semantic chunks using sentence embeddings and clustering."""
+    """Creates semantic chunks using sentence embeddings and similarity thresholds.
+
+    Optimized approach:
+    - Uses centralized embedding model (shared singleton)
+    - Threshold-based chunking instead of clustering (faster)
+    - O(n) complexity vs O(n²) for clustering
+    """
 
     def __init__(
         self,
         model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
-        similarity_threshold: float = 0.7,
-        min_chunk_size: int = 100,
-        max_chunk_size: int = 1500,
+        similarity_threshold: float = 0.75,
+        min_chunk_size: int = 150,
+        max_chunk_size: int = 1200,
         overlap_sentences: int = 2,
     ):
         """Initialize semantic chunker.
 
         Args:
             model_name: Sentence transformer model for embeddings
-            similarity_threshold: Threshold for sentence similarity (0-1)
+            similarity_threshold: Cosine similarity threshold (0-1) for keeping sentences together
+                                 Higher = more strict grouping (0.75 recommended for medical content)
             min_chunk_size: Minimum characters per chunk
             max_chunk_size: Maximum characters per chunk
             overlap_sentences: Number of sentences to overlap at boundaries
@@ -67,24 +81,13 @@ class SemanticChunker:
         self.max_chunk_size = max_chunk_size
         self.overlap_sentences = overlap_sentences
 
-        # Load model
-        self.model: Optional[SentenceTransformer] = None
-        self._load_model()
+        # Use shared model instance from centralized loader
+        self.model: SentenceTransformer = get_sentence_transformer(model_name)
 
         logger.info(
             f"SemanticChunker: Initialized with {model_name}, "
             f"threshold={similarity_threshold}, size={min_chunk_size}-{max_chunk_size}"
         )
-
-    def _load_model(self) -> None:
-        """Lazy load sentence transformer."""
-        if self.model is None:
-            try:
-                self.model = SentenceTransformer(self.model_name)
-                logger.info(f"SemanticChunker: Loaded model {self.model_name}")
-            except Exception as e:
-                logger.error(f"SemanticChunker: Failed to load model - {e}")
-                raise
 
     def chunk_documents(
         self,
@@ -193,7 +196,12 @@ class SemanticChunker:
         self,
         embeddings: np.ndarray
     ) -> np.ndarray:
-        """Cluster sentence embeddings by similarity.
+        """Group sentences by semantic similarity using threshold-based approach.
+
+        Optimized method:
+        - O(n) complexity instead of O(n²) clustering
+        - More interpretable (direct similarity threshold)
+        - Faster for long documents
 
         Args:
             embeddings: Sentence embedding matrix (n_sentences x embedding_dim)
@@ -203,21 +211,41 @@ class SemanticChunker:
         """
         n_sentences = len(embeddings)
 
-        # Determine number of clusters based on similarity
-        # Use agglomerative clustering with distance threshold
-        clustering = AgglomerativeClustering(
-            n_clusters=None,
-            distance_threshold=1 - self.similarity_threshold,  # Convert similarity to distance
-            metric='cosine',
-            linkage='average'
-        )
+        if n_sentences == 0:
+            return np.array([])
+
+        if n_sentences == 1:
+            return np.array([0])
 
         try:
-            clusters = clustering.fit_predict(embeddings)
+            # Initialize clusters
+            clusters = np.zeros(n_sentences, dtype=int)
+            current_cluster = 0
+
+            # Assign first sentence to cluster 0
+            clusters[0] = current_cluster
+
+            # Iterate through sentences and group by similarity
+            for i in range(1, n_sentences):
+                # Compute similarity with previous sentence
+                similarity = cosine_similarity(
+                    embeddings[i-1:i],
+                    embeddings[i:i+1]
+                )[0][0]
+
+                # If similar enough, keep in same cluster
+                if similarity >= self.similarity_threshold:
+                    clusters[i] = current_cluster
+                else:
+                    # Start new cluster
+                    current_cluster += 1
+                    clusters[i] = current_cluster
+
+            logger.debug(f"SemanticChunker: Created {current_cluster + 1} clusters from {n_sentences} sentences")
             return clusters
 
         except Exception as e:
-            logger.warning(f"SemanticChunker: Clustering failed - {e}, using sequential groups")
+            logger.warning(f"SemanticChunker: Similarity grouping failed - {e}, using sequential groups")
             # Fallback: simple sequential grouping
             group_size = max(3, n_sentences // 5)  # ~5 groups
             return np.array([i // group_size for i in range(n_sentences)])

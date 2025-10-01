@@ -2,14 +2,24 @@
 
 Integrates:
 - Query expansion (medical synonyms)
-- Semantic chunking (instead of fixed-size)
+- Semantic chunking (threshold-based, optimized)
 - Advanced reranking (ColBERT-style + temporal)
 - Knowledge graph reasoning
 - Claim validation with citation tracing
+
+Architecture:
+- Two-phase design: Ingestion (offline) vs Runtime (online)
+- Ingestion: Build indices, save to disk (scripts/build_indices.py)
+- Runtime: Load pre-built indices from disk (this file)
+- Centralized embedding models for efficiency
+- Lazy loading of heavy components
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_community.document_loaders import PyPDFDirectoryLoader, PubMedLoader
@@ -25,6 +35,7 @@ from src.rag.claim_validator import ClaimValidator
 from src.rag.knowledge_graph import KnowledgeGraphBuilder
 from src.rag.query_expander import QueryExpander
 from src.rag.semantic_chunker import SemanticChunker
+from src.utils.embeddings import get_langchain_embeddings
 from src.utils.llm import get_gemini_chat
 
 logger = logging.getLogger(__name__)
@@ -44,7 +55,22 @@ class RAGResult(BaseModel):
 
 
 class RAGSystem:
-    """Advanced RAG system with all enhancements."""
+    """Advanced RAG system with optimized two-phase architecture.
+
+    Ingestion Phase (offline - scripts/build_indices.py):
+    - Load documents
+    - Semantic chunking
+    - Generate embeddings
+    - Build FAISS index
+    - Build knowledge graph
+    - Persist to disk
+
+    Runtime Phase (online - this class in query mode):
+    - Load pre-built indices from disk
+    - Lazy-load heavy components
+    - Fast startup
+    - Real-time query processing
+    """
 
     def __init__(
         self,
@@ -57,8 +83,8 @@ class RAGSystem:
         """Initialize RAG system.
 
         Args:
-            docs_path: Directory with PDF documents
-            enable_pubmed: Whether to fetch PubMed articles
+            docs_path: Directory with PDF documents (used during ingestion)
+            enable_pubmed: Whether to fetch PubMed articles (used during ingestion)
             embedding_model: Model for embeddings
             index_dir: Directory to save/load FAISS index
             kg_path: Path to save/load knowledge graph
@@ -69,64 +95,103 @@ class RAGSystem:
         self.index_dir = index_dir
         self.kg_path = kg_path
 
-        # Components (lazy initialized)
-        self.embeddings: Optional[HuggingFaceEmbeddings] = None
-        self.vectorstore: Optional[FAISS] = None
-        self.kg_builder: Optional[KnowledgeGraphBuilder] = None
+        # Heavy components (lazy initialized for fast startup)
+        self._embeddings: Optional[HuggingFaceEmbeddings] = None
+        self._vectorstore: Optional[FAISS] = None
+        self._kg_builder: Optional[KnowledgeGraphBuilder] = None
+        self._semantic_chunker: Optional[SemanticChunker] = None
 
-        # Modules
+        # Lightweight modules (initialized immediately)
         self.query_expander = QueryExpander()
-        self.semantic_chunker = SemanticChunker()
         self.reranker = AdvancedReranker()
         self.claim_validator = ClaimValidator()
 
-        # LLM for generation
+        # LLM for generation (API client - lightweight)
         self.llm = get_gemini_chat(model="gemini-2.5-flash", temperature=0.3)
 
-        logger.info("RAGSystem: Initialized")
+        logger.info("RAGSystem: Initialized (components will be lazy-loaded)")
+
+    @property
+    def embeddings(self) -> HuggingFaceEmbeddings:
+        """Lazy-load embeddings model (shared singleton)."""
+        if self._embeddings is None:
+            self._embeddings = get_langchain_embeddings(self.embedding_model_name)
+            logger.info(f"RAGSystem: Loaded embeddings model")
+        return self._embeddings
+
+    @property
+    def vectorstore(self) -> Optional[FAISS]:
+        """Get vectorstore (may be None until setup() is called)."""
+        return self._vectorstore
+
+    @property
+    def kg_builder(self) -> Optional[KnowledgeGraphBuilder]:
+        """Get knowledge graph builder (may be None until setup() is called)."""
+        return self._kg_builder
+
+    @property
+    def semantic_chunker(self) -> SemanticChunker:
+        """Lazy-load semantic chunker (only needed during ingestion)."""
+        if self._semantic_chunker is None:
+            self._semantic_chunker = SemanticChunker(
+                model_name=self.embedding_model_name,
+                similarity_threshold=0.75,  # Optimized for medical content
+                min_chunk_size=150,
+                max_chunk_size=1200,
+            )
+            logger.info(f"RAGSystem: Loaded semantic chunker")
+        return self._semantic_chunker
 
     def setup(self, force_rebuild: bool = False) -> None:
         """Setup RAG system (load or build indices).
+
+        Best Practice:
+        - In production/runtime: Call with force_rebuild=False (default)
+          → Fast startup, just loads from disk
+        - In ingestion pipeline: Call with force_rebuild=True
+          → Rebuilds indices from source documents
 
         Args:
             force_rebuild: Whether to force rebuild even if indices exist
         """
         logger.info("RAGSystem: Starting setup...")
 
-        # Initialize embeddings
-        self.embeddings = HuggingFaceEmbeddings(model_name=self.embedding_model_name)
-
-        # Try load existing
+        # Try load existing (fast path for runtime)
         if not force_rebuild:
             loaded = self._try_load_existing()
             if loaded:
-                logger.info("RAGSystem: Loaded existing indices")
+                logger.info("RAGSystem: ✓ Loaded existing indices (fast startup)")
                 return
+            else:
+                logger.warning(
+                    "RAGSystem: No existing indices found. "
+                    "Run scripts/build_indices.py first or call setup(force_rebuild=True)"
+                )
 
-        # Build from scratch
-        logger.info("RAGSystem: Building indices from scratch...")
+        # Build from scratch (slow path for ingestion)
+        logger.info("RAGSystem: Building indices from scratch (this will take a while)...")
 
         # Load documents
         docs = self._load_documents()
         logger.info(f"RAGSystem: Loaded {len(docs)} raw documents")
 
-        # Semantic chunking
+        # Semantic chunking (uses shared embedding model)
         chunks = self.semantic_chunker.chunk_documents(docs)
         logger.info(f"RAGSystem: Created {len(chunks)} semantic chunks")
 
-        # Build vector store
-        self.vectorstore = FAISS.from_documents(chunks, self.embeddings)
+        # Build vector store (uses shared embedding model)
+        self._vectorstore = FAISS.from_documents(chunks, self.embeddings)
         logger.info("RAGSystem: Built FAISS vectorstore")
 
         # Build knowledge graph
-        self.kg_builder = KnowledgeGraphBuilder()
-        self.kg_builder.build_from_documents(docs, persist_path=self.kg_path)
+        self._kg_builder = KnowledgeGraphBuilder()
+        self._kg_builder.build_from_documents(docs, persist_path=self.kg_path)
         logger.info("RAGSystem: Built knowledge graph")
 
-        # Persist
-        self._persist_indices()
+        # Persist with metadata
+        self._persist_indices(num_docs=len(docs), num_chunks=len(chunks))
 
-        logger.info("RAGSystem: Setup complete")
+        logger.info("RAGSystem: ✓ Setup complete")
 
     def query(
         self,
@@ -152,9 +217,10 @@ class RAGSystem:
         """
         logger.info(f"RAGSystem: Query - '{query[:50]}...'")
 
-        # Ensure setup
-        if self.vectorstore is None or self.kg_builder is None:
-            self.setup()
+        # Ensure indices are loaded
+        if self._vectorstore is None or self._kg_builder is None:
+            logger.info("RAGSystem: Indices not loaded, loading now...")
+            self.setup(force_rebuild=False)
 
         # Step 1: Query expansion
         expanded = self.query_expander.expand(query)
@@ -162,7 +228,7 @@ class RAGSystem:
 
         # Step 2: Vector retrieval (use expanded query)
         retrieval_query = expanded.expanded_query
-        retrieved_docs = self.vectorstore.similarity_search(
+        retrieved_docs = self._vectorstore.similarity_search(
             retrieval_query,
             k=top_k * 2  # Retrieve more for reranking
         )
@@ -177,7 +243,7 @@ class RAGSystem:
         logger.info(f"RAGSystem: Reranked to top {len(reranked_docs)}")
 
         # Step 4: Knowledge graph query
-        kg_result = self.kg_builder.query(query, max_hops=3)
+        kg_result = self._kg_builder.query(query, max_hops=3)
         kg_insights = kg_result.get("insights", "")
         logger.info(f"RAGSystem: KG insights - {len(kg_insights)} chars")
 
@@ -239,7 +305,7 @@ class RAGSystem:
         # Load PubMed
         if self.enable_pubmed:
             try:
-                pubmed_loader = PubMedLoader("dental caries gingivitis Indonesia")
+                pubmed_loader = PubMedLoader("dental caries gingivitis")
                 pubmed_docs = pubmed_loader.load()
 
                 for doc in pubmed_docs:
@@ -346,24 +412,35 @@ class RAGSystem:
         return citations
 
     def _try_load_existing(self) -> bool:
-        """Try to load existing indices.
+        """Try to load existing indices from disk.
 
         Returns:
-            True if loaded successfully
+            True if loaded successfully, False otherwise
         """
         try:
-            import os
-
             if os.path.isdir(self.index_dir) and os.path.exists(self.kg_path):
                 # Load vectorstore
-                self.vectorstore = FAISS.load_local(
+                self._vectorstore = FAISS.load_local(
                     self.index_dir,
                     self.embeddings,
                     allow_dangerous_deserialization=True
                 )
 
                 # Load KG
-                self.kg_builder = KnowledgeGraphBuilder.load(self.kg_path)
+                self._kg_builder = KnowledgeGraphBuilder.load(self.kg_path)
+
+                # Load metadata if exists
+                metadata_path = os.path.join(self.index_dir, "metadata.json")
+                if os.path.exists(metadata_path):
+                    with open(metadata_path, "r") as f:
+                        metadata = json.load(f)
+                        logger.info(
+                            f"RAGSystem: Loaded indices - "
+                            f"Version: {metadata.get('version', 'unknown')}, "
+                            f"Created: {metadata.get('created_at', 'unknown')}, "
+                            f"Docs: {metadata.get('num_documents', '?')}, "
+                            f"Chunks: {metadata.get('num_chunks', '?')}"
+                        )
 
                 return True
 
@@ -372,16 +449,41 @@ class RAGSystem:
 
         return False
 
-    def _persist_indices(self) -> None:
-        """Persist vectorstore and KG to disk."""
+    def _persist_indices(self, num_docs: int = 0, num_chunks: int = 0) -> None:
+        """Persist vectorstore and KG to disk with metadata.
+
+        Args:
+            num_docs: Number of source documents
+            num_chunks: Number of semantic chunks created
+        """
         try:
-            if self.vectorstore:
-                self.vectorstore.save_local(self.index_dir)
+            # Ensure directory exists
+            os.makedirs(self.index_dir, exist_ok=True)
+
+            # Save vectorstore
+            if self._vectorstore:
+                self._vectorstore.save_local(self.index_dir)
                 logger.info(f"RAGSystem: Saved vectorstore to {self.index_dir}")
 
-            if self.kg_builder:
-                self.kg_builder.save(self.kg_path)
+            # Save KG
+            if self._kg_builder:
+                self._kg_builder.save(self.kg_path)
                 logger.info(f"RAGSystem: Saved KG to {self.kg_path}")
+
+            # Save metadata
+            metadata = {
+                "version": "1.0",
+                "created_at": datetime.now().isoformat(),
+                "num_documents": num_docs,
+                "num_chunks": num_chunks,
+                "embedding_model": self.embedding_model_name,
+                "index_type": "FAISS",
+                "kg_path": self.kg_path,
+            }
+            metadata_path = os.path.join(self.index_dir, "metadata.json")
+            with open(metadata_path, "w") as f:
+                json.dump(metadata, f, indent=2)
+            logger.info(f"RAGSystem: Saved metadata to {metadata_path}")
 
         except Exception as e:
             logger.error(f"RAGSystem: Persist failed - {e}")

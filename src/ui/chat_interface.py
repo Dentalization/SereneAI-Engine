@@ -43,20 +43,39 @@ def get_db_connection() -> sqlite3.Connection:
 
 
 @st.cache_resource
+def load_rag_system():
+    """Load RAG system with pre-built indices (cached across sessions).
+
+    This function is cached by Streamlit, ensuring the RAG system is loaded
+    only once per application lifetime, dramatically improving startup time.
+
+    Returns:
+        RAGSystem instance with indices loaded from disk
+    """
+    logging.info("RAG: Loading system (will be cached)...")
+    from src.rag import RAGSystem
+
+    rag = RAGSystem()
+    rag.setup(force_rebuild=False)  # Load from disk only
+    logging.info("RAG: ✓ Loaded and cached")
+    return rag
+
+
+@st.cache_resource
 def warmup_resources() -> bool:
-    """Warm up heavy resources in a background thread without blocking UI."""
+    """Warm up heavy resources in a background thread without blocking UI.
+
+    Note: RAG system is now loaded via load_rag_system() with proper caching.
+    This function handles additional warmup tasks.
+    """
     def _warm():
         try:
             logging.info("WARMUP: Starting background warmup")
             # Lazy imports to avoid overhead on module import
-            from src.rag import RAGSystem
             from src.tools.yolo_tool import load_yolo_model
             from src.utils.llm import get_gemini_chat
             from langchain_core.messages import HumanMessage
 
-            # Preload vectorstore/KG
-            rag_system = RAGSystem()
-            rag_system.setup()
             # Preload YOLO
             load_yolo_model()
             # Prewarm Gemini
