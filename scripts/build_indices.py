@@ -138,7 +138,7 @@ def main():
 
         elapsed_time = time.time() - start_time
         logger.info("=" * 80)
-        logger.info("✓ Ingestion Complete!")
+        logger.info("[OK] Ingestion Complete!")
         logger.info(f"Total time: {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)")
         logger.info(f"FAISS index saved to: {args.index_dir}")
         logger.info(f"Knowledge graph saved to: {args.kg_path}")

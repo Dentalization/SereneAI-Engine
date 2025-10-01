@@ -75,24 +75,41 @@ def setup_logging() -> None:
     """Setup logging with rotation and level from LOG_LEVEL env var.
 
     The logger writes to both stdout and app.log with rotation.
+    UTF-8 encoding is used to prevent unicode issues on Windows.
     """
     if getattr(setup_logging, "_initialized", False):
         return
     log_level = os.getenv("LOG_LEVEL", "INFO").upper()  # DEBUG/INFO/WARNING/...
     level = getattr(logging, log_level, logging.INFO)
+
+    # Configure formatter
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+
+    # Setup basic config
     logging.basicConfig(
         level=level,
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
-    handler = RotatingFileHandler("app.log", maxBytes=1_000_000, backupCount=5)
+
+    # Add file handler with UTF-8 encoding
+    handler = RotatingFileHandler(
+        "app.log",
+        maxBytes=1_000_000,
+        backupCount=5,
+        encoding='utf-8'  # Prevent unicode encoding errors
+    )
     handler.setLevel(level)
+    handler.setFormatter(formatter)
+
     root_logger = logging.getLogger()
     # Avoid duplicate handlers if Streamlit reruns
     if not any(isinstance(h, RotatingFileHandler) for h in root_logger.handlers):
         root_logger.addHandler(handler)
+
     # Reduce noisy third-party logs
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("transformers").setLevel(logging.WARNING)
     logging.getLogger("faiss").setLevel(logging.WARNING)
+
     logging.info(f"Logging setup with level: {log_level}")
     setattr(setup_logging, "_initialized", True)

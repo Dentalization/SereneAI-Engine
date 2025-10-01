@@ -160,7 +160,7 @@ class RAGSystem:
         if not force_rebuild:
             loaded = self._try_load_existing()
             if loaded:
-                logger.info("RAGSystem: ✓ Loaded existing indices (fast startup)")
+                logger.info("RAGSystem: [OK] Loaded existing indices (fast startup)")
                 return
             else:
                 logger.warning(
@@ -191,7 +191,7 @@ class RAGSystem:
         # Persist with metadata
         self._persist_indices(num_docs=len(docs), num_chunks=len(chunks))
 
-        logger.info("RAGSystem: ✓ Setup complete")
+        logger.info("RAGSystem: [OK] Setup complete")
 
     def query(
         self,

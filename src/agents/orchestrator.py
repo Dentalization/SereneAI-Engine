@@ -382,23 +382,26 @@ def run_agent(
         # Run graph
         result = app.invoke(state)
 
-        response = result.final_response or "Maaf, terjadi kesalahan."
-        sources = result.sources or []
+        # Result is a dict, not an object - use dict access
+        response = result.get("final_response") or "Maaf, terjadi kesalahan."
+        sources = result.get("sources") or []
+        confidence = result.get("confidence_score", 0.0)
+        conversation_id = result.get("conversation_id", state.conversation_id)
 
         logger.info(
             f"Orchestrator: Run complete - Response: {len(response)} chars, "
-            f"Sources: {len(sources)}, Confidence: {result.confidence_score:.2f}"
+            f"Sources: {len(sources)}, Confidence: {confidence:.2f}"
         )
 
         return {
             "response": response,
             "sources": [src.model_dump() if hasattr(src, 'model_dump') else src for src in sources],
-            "confidence": result.confidence_score,
-            "conversation_id": result.conversation_id,
+            "confidence": confidence,
+            "conversation_id": conversation_id,
         }
 
     except Exception as e:
-        logger.error(f"Orchestrator: Run failed - {e}")
+        logger.error(f"Orchestrator: Run failed - {e}", exc_info=True)
         return {
             "response": "Maaf, ada kesalahan teknis. Coba lagi atau konsultasi dokter gigi.",
             "sources": [],

@@ -57,7 +57,7 @@ def load_rag_system():
 
     rag = RAGSystem()
     rag.setup(force_rebuild=False)  # Load from disk only
-    logging.info("RAG: ✓ Loaded and cached")
+    logging.info("RAG: [OK] Loaded and cached")
     return rag
 
 
