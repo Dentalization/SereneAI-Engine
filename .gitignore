@@ -206,6 +206,7 @@ requirements-dev.txt
 
 # RAG persisted index and graph
 .rag/
+.checkpoints/
 
 # Temp uploads
 temp_*.jpg
