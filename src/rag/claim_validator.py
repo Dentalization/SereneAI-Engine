@@ -86,35 +86,40 @@ class ClaimValidator:
 
 Respond with ONLY valid JSON."""
 
-    VALIDATION_PROMPT = """Validate whether a claim is supported by source documents.
+    BATCH_VALIDATION_PROMPT = """Validate multiple claims against source documents in batch.
 
-**Claim:** {claim_text}
+**Claims to Validate:**
+{claims_list}
 
 **Source Documents:**
 {sources_text}
 
 **Task:**
-1. Check if claim is EXPLICITLY stated or STRONGLY IMPLIED in sources
-2. Find exact snippets that support the claim
-3. Assign confidence:
-   - 1.0: Explicitly stated in sources
-   - 0.7-0.9: Strongly implied by sources
-   - 0.4-0.6: Partially supported or indirectly mentioned
-   - 0.0-0.3: Not supported or contradicts sources
-4. List source IDs (numbers) that support claim
+For EACH claim, check if it is EXPLICITLY stated or STRONGLY IMPLIED in sources.
+
+**Confidence Scoring:**
+- 1.0: Explicitly stated in sources
+- 0.7-0.9: Strongly implied by sources
+- 0.4-0.6: Partially supported or indirectly mentioned
+- 0.0-0.3: Not supported or contradicts sources
 
 **Validation Criteria:**
 - ✅ Supported: Claim matches source content (exact or paraphrased)
 - ⚠️ Partially: Claim generalizes source info (may be too broad)
 - ❌ Unsupported: Claim adds new info not in sources OR contradicts sources
 
-**Output JSON:**
+**Output JSON (array of results, one per claim):**
 {{
-  "is_supported": boolean,
-  "confidence": 0.0-1.0,
-  "supporting_sources": [1, 3],
-  "supporting_snippets": ["exact quotes from sources"],
-  "reasoning": "brief explanation"
+  "validations": [
+    {{
+      "claim_index": 0,
+      "is_supported": boolean,
+      "confidence": 0.0-1.0,
+      "supporting_sources": [1, 3],
+      "reasoning": "brief explanation"
+    }},
+    ...
+  ]
 }}
 
 Respond with ONLY valid JSON."""
@@ -158,32 +163,39 @@ Respond with ONLY valid JSON."""
 
             logger.info(f"ClaimValidator: Extracted {len(claims_data)} claims")
 
-            # Step 2: Validate each claim
+            # Step 2: Batch validate claims (5 per batch for efficiency)
             validated_claims: List[Claim] = []
+            batch_size = 5
 
-            for claim_dict in claims_data:
-                claim_text = claim_dict.get("claim_text", "")
-                claim_type = claim_dict.get("claim_type", "unknown")
+            for i in range(0, len(claims_data), batch_size):
+                batch = claims_data[i:i+batch_size]
+                logger.info(f"ClaimValidator: Validating batch {i//batch_size + 1} ({len(batch)} claims)")
 
-                validation = self._validate_claim(claim_text, sources)
+                validations = self._validate_claims_batch(batch, sources)
 
-                validated_claim = Claim(
-                    claim_text=claim_text,
-                    claim_type=claim_type,
-                    is_supported=validation.get("is_supported", False),
-                    confidence=validation.get("confidence", 0.0),
-                    supporting_sources=validation.get("supporting_sources", []),
-                    supporting_snippets=validation.get("supporting_snippets", []),
-                    reasoning=validation.get("reasoning", ""),
-                )
+                for j, claim_dict in enumerate(batch):
+                    claim_text = claim_dict.get("claim_text", "")
+                    claim_type = claim_dict.get("claim_type", "unknown")
 
-                validated_claims.append(validated_claim)
+                    validation = validations.get(j, {})
 
-                logger.debug(
-                    f"ClaimValidator: Claim '{claim_text[:50]}...' - "
-                    f"Supported={validated_claim.is_supported}, "
-                    f"Confidence={validated_claim.confidence:.2f}"
-                )
+                    validated_claim = Claim(
+                        claim_text=claim_text,
+                        claim_type=claim_type,
+                        is_supported=validation.get("is_supported", False),
+                        confidence=validation.get("confidence", 0.0),
+                        supporting_sources=validation.get("supporting_sources", []),
+                        supporting_snippets=validation.get("supporting_snippets", []),
+                        reasoning=validation.get("reasoning", ""),
+                    )
+
+                    validated_claims.append(validated_claim)
+
+                    logger.debug(
+                        f"ClaimValidator: Claim '{claim_text[:50]}...' - "
+                        f"Supported={validated_claim.is_supported}, "
+                        f"Confidence={validated_claim.confidence:.2f}"
+                    )
 
             # Step 3: Compute overall metrics
             result = self._compute_validation_metrics(validated_claims)
@@ -233,59 +245,42 @@ Respond with ONLY valid JSON."""
 
         except Exception as e:
             logger.error(f"ClaimValidator: Claim extraction failed - {e}")
-            # Fallback: split by periods
-            return self._fallback_extract_claims(response)
+            # Raise clear exception - NO fallback to rules
+            from src.utils.exceptions import ClaimValidationError
+            raise ClaimValidationError(
+                message=f"Failed to extract claims from response: {str(e)}",
+                user_action="The system could not analyze the response properly. Please try again."
+            ) from e
 
-    def _fallback_extract_claims(self, response: str) -> List[Dict[str, str]]:
-        """Fallback claim extraction using simple heuristics.
-
-        Args:
-            response: Response text
-
-        Returns:
-            List of claim dicts
-        """
-        # Split by sentence
-        sentences = [s.strip() for s in response.split(".") if s.strip()]
-
-        claims = []
-        for sent in sentences:
-            # Skip greetings, questions, disclaimers
-            if any(word in sent.lower() for word in ["halo", "terima kasih", "konsultasi", "dokter gigi", "?"]):
-                continue
-
-            # Keep factual-sounding sentences
-            if len(sent.split()) >= 5:  # At least 5 words
-                claims.append({
-                    "claim_text": sent,
-                    "claim_type": "unknown"
-                })
-
-        return claims[:10]  # Limit to avoid processing too many
-
-    def _validate_claim(
+    def _validate_claims_batch(
         self,
-        claim_text: str,
+        claims: List[Dict[str, str]],
         sources: List[Document]
-    ) -> Dict[str, Any]:
-        """Validate a single claim against sources.
+    ) -> Dict[int, Dict[str, Any]]:
+        """Validate multiple claims in a single batch LLM call.
 
         Args:
-            claim_text: Claim to validate
+            claims: List of claim dicts with claim_text
             sources: Source documents
 
         Returns:
-            Validation dict with is_supported, confidence, sources, snippets
+            Dict mapping claim index to validation result
         """
         try:
-            # Format sources for prompt
+            # Format sources for prompt (increase to 500 chars for better context)
             sources_text = "\n\n".join([
-                f"**Source {i+1}:** {doc.page_content[:300]}..."
+                f"**Source {i+1}:** {doc.page_content[:500]}..."
                 for i, doc in enumerate(sources)
             ])
 
-            prompt = self.VALIDATION_PROMPT.format(
-                claim_text=claim_text,
+            # Format claims as numbered list
+            claims_list = "\n".join([
+                f"{i}. {claim['claim_text']}"
+                for i, claim in enumerate(claims)
+            ])
+
+            prompt = self.BATCH_VALIDATION_PROMPT.format(
+                claims_list=claims_list,
                 sources_text=sources_text,
             )
 
@@ -298,67 +293,36 @@ Respond with ONLY valid JSON."""
             json_match = re.search(r"\{.*\}", raw, re.DOTALL)
             json_str = json_match.group(0) if json_match else raw
 
-            validation = json.loads(json_str)
-            return validation
+            result = json.loads(json_str)
+            validations_list = result.get("validations", [])
+
+            # Convert to dict indexed by claim_index
+            validations_dict = {}
+            for val in validations_list:
+                idx = val.get("claim_index", -1)
+                if idx >= 0 and idx < len(claims):
+                    validations_dict[idx] = val
+
+            # Check for missing validations - raise error if any
+            for i, claim in enumerate(claims):
+                if i not in validations_dict:
+                    logger.error(f"ClaimValidator: Missing validation for claim {i}")
+                    from src.utils.exceptions import ClaimValidationError
+                    raise ClaimValidationError(
+                        message=f"LLM failed to validate claim {i}: {claim['claim_text'][:50]}",
+                        user_action="Validation incomplete. Please try again or rephrase your question."
+                    )
+
+            return validations_dict
 
         except Exception as e:
-            logger.error(f"ClaimValidator: Validation error for claim - {e}")
-            # Fallback: keyword matching
-            return self._fallback_validate_claim(claim_text, sources)
-
-    def _fallback_validate_claim(
-        self,
-        claim_text: str,
-        sources: List[Document]
-    ) -> Dict[str, Any]:
-        """Fallback validation using keyword matching.
-
-        Args:
-            claim_text: Claim to validate
-            sources: Source documents
-
-        Returns:
-            Basic validation dict
-        """
-        # Extract keywords from claim (simple approach)
-        claim_keywords = set(
-            word.lower()
-            for word in re.findall(r'\w+', claim_text)
-            if len(word) > 3
-        )
-
-        # Check keyword overlap with sources
-        max_overlap = 0
-        supporting_sources = []
-
-        for i, doc in enumerate(sources):
-            source_text = doc.page_content.lower()
-            overlap = sum(1 for kw in claim_keywords if kw in source_text)
-
-            if overlap > max_overlap:
-                max_overlap = overlap
-
-            if overlap >= 2:  # At least 2 keywords match
-                supporting_sources.append(i + 1)
-
-        # Compute confidence based on overlap
-        if max_overlap >= 4:
-            confidence = 0.8
-            is_supported = True
-        elif max_overlap >= 2:
-            confidence = 0.5
-            is_supported = True
-        else:
-            confidence = 0.3
-            is_supported = False
-
-        return {
-            "is_supported": is_supported,
-            "confidence": confidence,
-            "supporting_sources": supporting_sources[:3],
-            "supporting_snippets": [],
-            "reasoning": f"Keyword overlap: {max_overlap} keywords",
-        }
+            logger.error(f"ClaimValidator: Batch validation error - {e}")
+            # Raise clear exception - NO fallback to keyword matching
+            from src.utils.exceptions import ClaimValidationError
+            raise ClaimValidationError(
+                message=f"Failed to validate claims in batch: {str(e)}",
+                user_action="The system could not verify the information properly. Please try again."
+            ) from e
 
     def _compute_validation_metrics(
         self,
@@ -386,10 +350,10 @@ Respond with ONLY valid JSON."""
         supported_count = sum(1 for c in claims if c.is_supported)
         unsupported_pct = (len(claims) - supported_count) / len(claims) * 100
 
-        # Determine hallucination risk
-        if unsupported_pct < 20:
+        # Determine hallucination risk (relaxed thresholds for better UX)
+        if unsupported_pct < 35:  # Was 20%
             hallucination_risk = "low"
-        elif unsupported_pct < 40:
+        elif unsupported_pct < 60:  # Was 40%
             hallucination_risk = "medium"
         else:
             hallucination_risk = "high"

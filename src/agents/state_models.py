@@ -95,6 +95,24 @@ class SOCRATESProfile(BaseModel):
             raise ValueError("Severity must be between 1 and 10")
         return v
 
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'SOCRATESProfile':
+        """Safe deserialization from dict.
+
+        Args:
+            data: Dict or SOCRATESProfile instance
+
+        Returns:
+            SOCRATESProfile instance
+        """
+        if isinstance(data, cls):
+            return data
+        if isinstance(data, dict):
+            # Filter only valid fields
+            valid_fields = {k: v for k, v in data.items() if k in cls.model_fields}
+            return cls(**valid_fields)
+        return cls()  # Return empty if invalid
+
 
 class UserProfile(BaseModel):
     """User profile with medical history and demographics."""
@@ -179,9 +197,12 @@ class AgentState(BaseModel):
         return "\n".join([f"{msg.role.value}: {msg.content}" for msg in recent])
 
     def update_profile(self, **kwargs) -> None:
-        """Update user profile fields."""
+        """Update user profile fields with safe serialization."""
         for key, value in kwargs.items():
             if hasattr(self.user_profile, key):
+                # Special handling for symptoms/SOCRATES profile
+                if key == "symptoms" and isinstance(value, dict):
+                    value = SOCRATESProfile.from_dict(value)
                 setattr(self.user_profile, key, value)
         self.user_profile.last_updated = datetime.now()
 

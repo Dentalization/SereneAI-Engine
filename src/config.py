@@ -31,8 +31,8 @@ def load_config() -> Dict[str, Any]:
         "docs_path": "docs/",
         # SQLite DB path for UI persistence.
         "db_path": "dental_chatbot.db",
-        # Detection confidence threshold for YOLO predictions.
-        "confidence_threshold": 0.5,
+        # Detection confidence threshold for YOLO predictions (lowered to 0.3 for better recall).
+        "confidence_threshold": 0.3,
         # Max allowed upload size (in MB) for images.
         "max_file_size_mb": 5,
         # Cache size used by RAG LRU cache.
@@ -110,6 +110,8 @@ def setup_logging() -> None:
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("transformers").setLevel(logging.WARNING)
     logging.getLogger("faiss").setLevel(logging.WARNING)
+    logging.getLogger("grpc").setLevel(logging.ERROR)  # Suppress ALTS warnings
+    logging.getLogger("google").setLevel(logging.WARNING)  # Suppress Google API noise
 
     logging.info(f"Logging setup with level: {log_level}")
     setattr(setup_logging, "_initialized", True)

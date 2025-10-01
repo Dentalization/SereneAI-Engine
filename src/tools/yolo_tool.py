@@ -133,15 +133,26 @@ def detect_issues(image_path: str, threshold: float | None = None) -> Tuple[str,
         with torch.inference_mode():
             results = model(img)[0]
         detections: List[Dict[str, Any]] = []
+        threshold_val = threshold or config["confidence_threshold"]
+
         for result in results.boxes:
             conf = result.conf.item()
-            if conf >= (threshold or config["confidence_threshold"]):
-                cls_idx = int(result.cls.item())
-                cls = model.names[cls_idx]
-                box = result.xyxy.tolist()[0]
+            cls_idx = int(result.cls.item())
+            cls = model.names[cls_idx]
+            box = result.xyxy.tolist()[0]
+
+            # Log all detections for debugging
+            logging.info(f"YOLO Detection: class={cls}, conf={conf:.3f}, threshold={threshold_val}")
+
+            if conf >= threshold_val:
                 detections.append({"class": cls, "confidence": conf, "bbox": box})
+                logging.info(f"  -> ACCEPTED (above threshold)")
+            else:
+                logging.debug(f"  -> FILTERED (below threshold {threshold_val})")
+
         if not detections:
-            logging.warning("No dental detections; possible misconfiguration.")
+            logging.warning(f"No dental detections passed threshold {threshold_val}. "
+                          f"Total detected: {len(results.boxes)}")
         spatial_insights = get_spatial_insights(image_path, detections)
         annotated_img = results.plot()
         unique_id = uuid.uuid4().hex

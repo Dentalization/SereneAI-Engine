@@ -47,56 +47,13 @@ class RAGResult(BaseModel):
 
 
 class RAGAgent(BaseAgent):
-    """Agent for evidence-based retrieval with hallucination detection."""
+    """Agent for evidence-based retrieval using centralized RAG system.
 
-    VALIDATION_PROMPT = """You are a fact-checker verifying dental advice against source documents.
-
-**Generated Response:**
-{response}
-
-**Retrieved Source Documents:**
-{sources_text}
-
-**Your Task:**
-1. Extract individual factual claims from the response
-2. For each claim, check if it's supported by source documents
-3. Assign confidence: 1.0 (explicitly stated), 0.7 (strongly implied), 0.5 (weakly implied), 0.0 (unsupported)
-4. List source IDs that support each claim
-
-**Output JSON Schema:**
-{{
-  "claims": [
-    {{
-      "claim": "extracted factual statement",
-      "is_supported": boolean,
-      "confidence": 0.0-1.0,
-      "supporting_sources": [1, 2]
-    }}
-  ],
-  "overall_confidence": 0.0-1.0,
-  "hallucination_risk": "low|medium|high",
-  "issues": ["any unsupported or questionable claims"]
-}}
-
-**Guidelines:**
-- Only validate factual medical/dental claims (not greetings/questions)
-- Mark as unsupported if claim contradicts sources or adds new info not in sources
-- Overall confidence = average of individual claims
-- Hallucination risk: low (<20% unsupported), medium (20-40%), high (>40%)
-
-Respond with ONLY valid JSON."""
+    Note: Validation is handled by RAGSystem.query() to avoid duplication.
+    """
 
     def __init__(self):
-        super().__init__(
-            name="RAGAgent",
-            max_retries=2,
-            retry_delay=1.0,
-            enable_circuit_breaker=True,
-        )
-        self.llm = get_gemini_chat(
-            model="gemini-2.5-flash",
-            temperature=0.0,  # Deterministic for validation
-        )
+        super().__init__(name="RAGAgent")
 
     def _execute(self, state: AgentState, **kwargs) -> Dict[str, Any]:
         """Execute RAG retrieval and validation."""
@@ -104,18 +61,22 @@ Respond with ONLY valid JSON."""
 
         # Step 1: Retrieve documents and generate response
         try:
-            # Lazy import to avoid circular dependency
-            from src.rag import RAGSystem
+            # Use cached singleton to avoid reinstantiation overhead
+            from src.ui.chat_interface import get_rag_system_singleton
 
             detections_json = json.dumps([d.model_dump() for d in state.detections]) if state.detections else ""
 
-            # Initialize RAG system
-            rag_system = RAGSystem()
-            rag_system.setup()
+            # Get cached RAG system (no setup needed, already loaded)
+            rag_system = get_rag_system_singleton()
+            logger.debug("RAGAgent: Using cached RAGSystem singleton")
+
+            # Build contextualized query for better retrieval
+            contextualized_query = self._build_contextualized_query(state)
+            logger.debug(f"RAGAgent: Contextualized query: {contextualized_query[:100]}...")
 
             # Query RAG system
             result = rag_system.query(
-                query=state.input,
+                query=contextualized_query,
                 detections=detections_json,
                 spatial_insights=state.spatial_insights,
                 history=[msg.model_dump() for msg in state.history],
@@ -132,82 +93,89 @@ Respond with ONLY valid JSON."""
             logger.error(f"RAGAgent: Retrieval failed - {e}")
             raise
 
-        # Step 2: Validate response against sources
-        try:
-            validation_result = self._validate_claims(rag_response, sources)
+        # Step 2: Use validation from RAGSystem (already computed)
+        validation_result = result.validation_result
 
-            logger.info(
-                f"RAGAgent: Validation - Confidence={validation_result['overall_confidence']:.2f}, "
-                f"Risk={validation_result['hallucination_risk']}, "
-                f"Claims={len(validation_result.get('claims', []))}"
+        if not validation_result:
+            logger.error("RAGAgent: No validation result from RAGSystem")
+            from src.utils.exceptions import RAGError
+            raise RAGError(
+                message="RAG system did not provide validation result",
+                user_action="The system could not validate the response. Please try again."
             )
 
-            # Step 3: Generate recommendations based on confidence
-            recommendations = self._generate_recommendations(
-                validation_result,
-                state.user_profile.symptoms
+        # Strict validation - NO defaults
+        if "overall_confidence" not in validation_result:
+            logger.error("RAGAgent: Missing overall_confidence in validation result")
+            from src.utils.exceptions import RAGError
+            raise RAGError(
+                message="Validation result missing overall_confidence field",
+                user_action="The system could not properly validate the response. Please try again."
             )
 
-            return {
-                "response": rag_response,
-                "sources": sources,
-                "claim_validations": validation_result.get("claims", []),
-                "overall_confidence": validation_result["overall_confidence"],
-                "hallucination_risk": validation_result["hallucination_risk"],
-                "recommendations": recommendations,
-            }
+        if "hallucination_risk" not in validation_result:
+            logger.error("RAGAgent: Missing hallucination_risk in validation result")
+            from src.utils.exceptions import RAGError
+            raise RAGError(
+                message="Validation result missing hallucination_risk field",
+                user_action="The system could not properly validate the response. Please try again."
+            )
 
-        except Exception as e:
-            logger.warning(f"RAGAgent: Validation failed, continuing without - {e}")
-            # Return without validation if it fails
-            return {
-                "response": rag_response,
-                "sources": sources,
-                "claim_validations": [],
-                "overall_confidence": 0.7,  # Default moderate confidence
-                "hallucination_risk": "medium",
-                "recommendations": ["Please consult a dentist for professional diagnosis"],
-            }
-
-    def _validate_claims(self, response: str, sources: List[SourceCitation]) -> Dict[str, Any]:
-        """Validate response claims against source documents."""
-        logger.info("RAGAgent: Validating claims against sources")
-
-        # Prepare sources text
-        sources_text = "\n\n".join([
-            f"**Source {src.id} ({src.provider}):** {src.snippet}"
-            for src in sources
-        ])
-
-        prompt = self.VALIDATION_PROMPT.format(
-            response=response,
-            sources_text=sources_text,
+        logger.info(
+            f"RAGAgent: Validation from RAGSystem - Confidence={validation_result['overall_confidence']:.2f}, "
+            f"Risk={validation_result['hallucination_risk']}"
         )
 
-        try:
-            llm_response = self.llm.invoke(
-                [HumanMessage(content=prompt)],
-                config={"response_format": {"type": "json_object"}},
-            )
-            raw = llm_response.content.strip()
+        # Step 3: Generate recommendations based on confidence
+        recommendations = self._generate_recommendations(
+            validation_result,
+            state.user_profile.symptoms
+        )
 
-            json_match = re.search(r"\{.*\}", raw, re.DOTALL)
-            json_str = json_match.group(0) if json_match else raw
+        return {
+            "response": rag_response,
+            "sources": sources,
+            "claim_validations": validation_result.get("claims", []),
+            "overall_confidence": validation_result["overall_confidence"],
+            "hallucination_risk": validation_result["hallucination_risk"],
+            "recommendations": recommendations,
+        }
 
-            validation = json.loads(json_str)
-            logger.debug(f"RAGAgent: Validation result: {validation}")
+    def _build_contextualized_query(self, state: AgentState) -> str:
+        """Build enhanced query with conversation context for better retrieval.
 
-            return validation
+        Args:
+            state: Current agent state
 
-        except Exception as e:
-            logger.error(f"RAGAgent: Claim validation LLM call failed - {e}")
-            # Fallback: assume moderate confidence
-            return {
-                "claims": [],
-                "overall_confidence": 0.7,
-                "hallucination_risk": "medium",
-                "issues": ["Validation unavailable"],
-            }
+        Returns:
+            Contextualized query string
+        """
+        parts = []
+
+        # Add chief complaint if available
+        if state.user_profile.chief_complaint:
+            parts.append(f"Chief Complaint: {state.user_profile.chief_complaint}")
+
+        # Add SOCRATES symptoms
+        socrates = state.user_profile.socrates
+        if socrates.site:
+            parts.append(f"Location: {socrates.site}")
+        if socrates.character:
+            parts.append(f"Type: {socrates.character}")
+        if socrates.severity:
+            parts.append(f"Severity: {socrates.severity}/10")
+        if socrates.onset:
+            parts.append(f"Started: {socrates.onset}")
+        if socrates.time_course:
+            parts.append(f"Progression: {socrates.time_course}")
+
+        # Add current query
+        parts.append(f"Query: {state.input}")
+
+        # Combine with newlines for structure
+        contextualized = "\n".join(parts)
+
+        return contextualized if len(parts) > 1 else state.input
 
     def _generate_recommendations(
         self,
@@ -217,9 +185,9 @@ Respond with ONLY valid JSON."""
         """Generate actionable recommendations based on validation and symptoms."""
         recommendations = []
 
-        # Check hallucination risk
-        risk = validation_result.get("hallucination_risk", "medium")
-        confidence = validation_result.get("overall_confidence", 0.7)
+        # Check hallucination risk (NO defaults - validation_result must have these)
+        risk = validation_result["hallucination_risk"]
+        confidence = validation_result["overall_confidence"]
 
         if risk == "high" or confidence < 0.5:
             recommendations.append(

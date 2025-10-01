@@ -62,6 +62,25 @@ def load_rag_system():
 
 
 @st.cache_resource
+def get_rag_system_singleton():
+    """Get cached RAGSystem singleton for agent use.
+
+    This prevents agents from reinstantiating RAGSystem on every request,
+    which was causing 3-5 second overhead per request.
+
+    Returns:
+        Cached RAGSystem instance
+    """
+    logging.info("RAG Singleton: Initializing for agent use...")
+    from src.rag import RAGSystem
+
+    rag = RAGSystem()
+    rag.setup(force_rebuild=False)  # Load pre-built indices
+    logging.info("RAG Singleton: [OK] Cached and ready")
+    return rag
+
+
+@st.cache_resource
 def warmup_resources() -> bool:
     """Warm up heavy resources in a background thread without blocking UI.
 

@@ -1,24 +1,25 @@
-"""Vision Agent for dental image analysis using YOLO with quality checks.
+"""Vision Agent for dental image analysis using YOLO with LLM-based quality checks.
 
 This agent:
-- Validates image quality (blur, lighting, format)
+- Validates image quality using Gemini Vision (LLM-driven, NO hardcoded thresholds)
 - Runs YOLO detection on dental images
 - Generates spatial insights using Gemini vision
 - Provides actionable feedback on image quality
 """
 from __future__ import annotations
 
+import base64
 import logging
 import os
 from typing import Any, Dict, List
 
-import cv2
-import numpy as np
+from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field
 
 from src.agents.specialized.base_agent import BaseAgent
 from src.agents.state_models import AgentState, DetectionResult
 from src.tools.yolo_tool import detect_issues, validate_image, InvalidImageError
+from src.utils.llm import get_gemini_chat
 
 logger = logging.getLogger(__name__)
 
@@ -46,12 +47,7 @@ class VisionAgent(BaseAgent):
     """Agent for comprehensive dental image analysis."""
 
     def __init__(self):
-        super().__init__(
-            name="VisionAgent",
-            max_retries=2,
-            retry_delay=1.0,
-            enable_circuit_breaker=True,
-        )
+        super().__init__(name="VisionAgent")
 
     def _execute(self, state: AgentState, **kwargs) -> Dict[str, Any]:
         """Execute vision analysis pipeline."""
@@ -144,113 +140,101 @@ class VisionAgent(BaseAgent):
             raise
 
     def _assess_image_quality(self, image_path: str) -> ImageQuality:
-        """Assess dental image quality using computer vision metrics.
+        """Assess dental image quality using Gemini Vision API (LLM-driven).
 
-        Checks:
-        - Blur (Laplacian variance)
-        - Brightness (mean intensity)
-        - Contrast (std dev)
-        - Image size/resolution
+        NO hardcoded thresholds - the LLM determines quality.
         """
+        QUALITY_ASSESSMENT_PROMPT = """Assess this dental/oral image for quality and usability in AI analysis.
+
+Evaluate the following aspects:
+1. **Sharpness/Focus**: Is the image clear or blurry?
+2. **Lighting**: Is lighting adequate (not too dark/bright)?
+3. **Composition**: Are teeth/oral cavity visible and centered?
+4. **Resolution**: Is detail sufficient for analysis?
+5. **Obstructions**: Any fingers, objects blocking view?
+
+Provide assessment in JSON format:
+{{
+  "is_acceptable": boolean,  // Can this image be used for dental AI analysis?
+  "quality_score": 0.0-1.0,  // Overall quality rating
+  "issues": ["list of specific problems found"],
+  "recommendations": ["actionable suggestions to improve"]
+}}
+
+Be strict: Only mark as acceptable if image is CLEARLY usable for dental diagnosis.
+Respond with ONLY valid JSON."""
+
         try:
-            img = cv2.imread(image_path)
-            if img is None:
-                return ImageQuality(
-                    is_acceptable=False,
-                    quality_score=0.0,
-                    issues=["Cannot read image file"],
-                    recommendations=["Check file format (JPG/PNG only)"],
-                )
+            # Read image and encode as base64
+            with open(image_path, "rb") as f:
+                image_data = base64.b64encode(f.read()).decode("utf-8")
 
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            height, width = img.shape[:2]
+            # Determine MIME type
+            ext = os.path.splitext(image_path)[1].lower()
+            mime_type = {
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".png": "image/png",
+            }.get(ext, "image/jpeg")
 
-            issues = []
-            recommendations = []
-            scores = []
-
-            # 1. Blur detection (Laplacian variance)
-            laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-            blur_score = min(laplacian_var / 500.0, 1.0)  # Normalize
-            scores.append(blur_score)
-
-            if laplacian_var < 100:
-                issues.append("Image is blurry")
-                recommendations.append("Hold phone steady or use better lighting")
-            elif laplacian_var < 200:
-                issues.append("Image slightly out of focus")
-
-            logger.debug(f"VisionAgent Quality: Blur variance={laplacian_var:.2f}")
-
-            # 2. Brightness check
-            mean_brightness = gray.mean()
-            if mean_brightness < 50:
-                brightness_score = mean_brightness / 50.0
-                issues.append("Image too dark")
-                recommendations.append("Increase lighting or use flash")
-            elif mean_brightness > 200:
-                brightness_score = (255 - mean_brightness) / 55.0
-                issues.append("Image overexposed")
-                recommendations.append("Reduce lighting or move away from light source")
-            else:
-                brightness_score = 1.0
-            scores.append(brightness_score)
-
-            logger.debug(f"VisionAgent Quality: Brightness={mean_brightness:.2f}")
-
-            # 3. Contrast check
-            contrast = gray.std()
-            contrast_score = min(contrast / 60.0, 1.0)
-            scores.append(contrast_score)
-
-            if contrast < 30:
-                issues.append("Low contrast")
-                recommendations.append("Ensure good lighting on teeth area")
-
-            logger.debug(f"VisionAgent Quality: Contrast std={contrast:.2f}")
-
-            # 4. Resolution check
-            min_dimension = min(height, width)
-            if min_dimension < 100:
-                resolution_score = 0.0
-                issues.append("Resolution too low")
-                recommendations.append("Image must be at least 100x100 pixels")
-            elif min_dimension < 300:
-                resolution_score = min_dimension / 300.0
-                issues.append("Low resolution")
-                recommendations.append("Use higher resolution or get closer")
-            else:
-                resolution_score = 1.0
-
-            scores.append(resolution_score)
-
-            # Overall quality score (weighted average)
-            quality_score = (
-                blur_score * 0.35 +
-                brightness_score * 0.25 +
-                contrast_score * 0.25 +
-                resolution_score * 0.15
+            # Create vision LLM client
+            llm = get_gemini_chat(
+                model="gemini-2.0-flash-exp",  # Use vision-capable model
+                temperature=0.0,
             )
 
-            is_acceptable = quality_score >= 0.6 and len(issues) < 3
+            # Invoke with image
+            message = HumanMessage(
+                content=[
+                    {"type": "text", "text": QUALITY_ASSESSMENT_PROMPT},
+                    {
+                        "type": "image_url",
+                        "image_url": f"data:{mime_type};base64,{image_data}",
+                    },
+                ]
+            )
+
+            response = llm.invoke(
+                [message],
+                config={"response_format": {"type": "json_object"}},
+            )
+
+            # Parse LLM response
+            import json
+            import re
+
+            raw = response.content.strip()
+            json_match = re.search(r"\{.*\}", raw, re.DOTALL)
+            json_str = json_match.group(0) if json_match else raw
+
+            result = json.loads(json_str)
+
+            quality = ImageQuality(
+                is_acceptable=result.get("is_acceptable", False),
+                quality_score=result.get("quality_score", 0.0),
+                issues=result.get("issues", []),
+                recommendations=result.get("recommendations", []),
+            )
 
             logger.info(
-                f"VisionAgent Quality: Overall={quality_score:.2f}, "
-                f"Acceptable={is_acceptable}, Issues={len(issues)}"
+                f"VisionAgent Quality (LLM): Acceptable={quality.is_acceptable}, "
+                f"Score={quality.quality_score:.2f}, Issues={len(quality.issues)}"
             )
 
-            return ImageQuality(
-                is_acceptable=is_acceptable,
-                quality_score=quality_score,
-                issues=issues,
-                recommendations=recommendations,
-            )
+            return quality
+
+        except json.JSONDecodeError as e:
+            logger.error(f"VisionAgent: Failed to parse quality assessment JSON - {e}")
+            from src.utils.exceptions import VisionError
+            raise VisionError(
+                message=f"Failed to parse image quality assessment: {str(e)}",
+                user_action="The system could not assess image quality. Please try a different image."
+            ) from e
 
         except Exception as e:
             logger.error(f"VisionAgent: Quality assessment error - {e}")
-            return ImageQuality(
-                is_acceptable=True,  # Fail open - allow processing
-                quality_score=0.5,
-                issues=[],
-                recommendations=[],
-            )
+            from src.utils.exceptions import VisionError
+            raise VisionError(
+                message=f"Image quality assessment failed: {str(e)}",
+                user_action="Could not analyze image quality. Please ensure the image is a valid JPG/PNG file."
+            ) from e

@@ -1,10 +1,10 @@
-"""Base agent class for specialized agents with retry and fallback logic.
+"""Base agent class for specialized agents with fail-fast error handling.
 
 This module provides the foundation for all specialized agents with:
-- Retry logic with exponential backoff
-- Circuit breaker pattern
-- Fallback chain support
-- Structured logging and metrics
+- Structured execution interface
+- Exception propagation (NO fallbacks)
+- Execution metrics and logging
+- Integration with LLMRetryHandler for LLM operations
 """
 from __future__ import annotations
 
@@ -24,8 +24,6 @@ class AgentStatus(str, Enum):
 
     SUCCESS = "success"
     FAILURE = "failure"
-    FALLBACK = "fallback"
-    CIRCUIT_OPEN = "circuit_open"
 
 
 class AgentResult(BaseModel):
@@ -39,137 +37,82 @@ class AgentResult(BaseModel):
     confidence: float = 1.0
 
 
-class CircuitBreaker:
-    """Circuit breaker to prevent cascading failures."""
-
-    def __init__(
-        self,
-        failure_threshold: int = 5,
-        recovery_timeout: int = 60,
-        expected_exception: Type[Exception] = Exception,
-    ):
-        self.failure_threshold = failure_threshold
-        self.recovery_timeout = recovery_timeout
-        self.expected_exception = expected_exception
-        self.failure_count = 0
-        self.last_failure_time: Optional[float] = None
-        self.state = "closed"  # closed, open, half_open
-
-    def call(self, func, *args, **kwargs):
-        """Execute function with circuit breaker protection."""
-        if self.state == "open":
-            if time.time() - self.last_failure_time >= self.recovery_timeout:
-                self.state = "half_open"
-                logger.info("Circuit breaker entering half-open state")
-            else:
-                raise Exception("Circuit breaker is OPEN")
-
-        try:
-            result = func(*args, **kwargs)
-            if self.state == "half_open":
-                self.state = "closed"
-                self.failure_count = 0
-                logger.info("Circuit breaker recovered to closed state")
-            return result
-        except self.expected_exception as e:
-            self.failure_count += 1
-            self.last_failure_time = time.time()
-
-            if self.failure_count >= self.failure_threshold:
-                self.state = "open"
-                logger.error(f"Circuit breaker opened after {self.failure_count} failures")
-            raise e
-
-
 class BaseAgent(ABC):
     """Base class for all specialized agents."""
 
-    def __init__(
-        self,
-        name: str,
-        max_retries: int = 3,
-        retry_delay: float = 1.0,
-        enable_circuit_breaker: bool = True,
-    ):
-        self.name = name
-        self.max_retries = max_retries
-        self.retry_delay = retry_delay
-        self.circuit_breaker = CircuitBreaker() if enable_circuit_breaker else None
-        self.fallback_agents: list[BaseAgent] = []
+    def __init__(self, name: str):
+        """Initialize base agent.
 
-    def add_fallback(self, agent: BaseAgent) -> None:
-        """Add a fallback agent to be used if this agent fails."""
-        self.fallback_agents.append(agent)
-        logger.info(f"Added fallback agent {agent.name} to {self.name}")
+        Args:
+            name: Agent name for logging
+
+        Note:
+            Retry logic is delegated to LLMRetryHandler for LLM operations.
+            Agents should use get_llm_retry_handler() for all LLM calls.
+        """
+        self.name = name
 
     def execute(self, **kwargs) -> AgentResult:
-        """Execute agent with retry logic and fallback chain."""
+        """Execute agent with fail-fast error handling.
+
+        Philosophy:
+        - Execute once, propagate exceptions immediately
+        - NO retries at agent level (use LLMRetryHandler for LLM calls)
+        - NO fallback chains or circuit breakers
+        - Clear error messages for debugging
+
+        Returns:
+            AgentResult with status SUCCESS or raises exception
+
+        Raises:
+            LLMError subclasses: For LLM-related failures
+            Exception: For other agent failures
+        """
         start_time = time.time()
-        last_error: Optional[str] = None
 
-        for attempt in range(self.max_retries + 1):
-            try:
-                logger.info(f"{self.name}: Execution attempt {attempt + 1}/{self.max_retries + 1}")
+        try:
+            logger.info(f"{self.name}: Executing...")
+            data = self._execute(**kwargs)
 
-                if self.circuit_breaker:
-                    data = self.circuit_breaker.call(self._execute, **kwargs)
-                else:
-                    data = self._execute(**kwargs)
+            execution_time = (time.time() - start_time) * 1000
+            logger.info(f"{self.name}: Success in {execution_time:.2f}ms")
 
-                execution_time = (time.time() - start_time) * 1000
-                logger.info(f"{self.name}: Success in {execution_time:.2f}ms")
+            return AgentResult(
+                status=AgentStatus.SUCCESS,
+                data=data,
+                execution_time_ms=execution_time,
+                retries=0,
+            )
 
-                return AgentResult(
-                    status=AgentStatus.SUCCESS,
-                    data=data,
-                    execution_time_ms=execution_time,
-                    retries=attempt,
-                )
+        except Exception as e:
+            execution_time = (time.time() - start_time) * 1000
+            logger.error(f"{self.name}: Failed after {execution_time:.2f}ms - {str(e)}")
 
-            except Exception as e:
-                last_error = str(e)
-                logger.warning(
-                    f"{self.name}: Attempt {attempt + 1} failed: {last_error}"
-                )
-
-                if attempt < self.max_retries:
-                    delay = self.retry_delay * (2 ** attempt)  # Exponential backoff
-                    logger.info(f"{self.name}: Retrying in {delay}s...")
-                    time.sleep(delay)
-
-        # All retries exhausted, try fallback chain
-        if self.fallback_agents:
-            logger.warning(f"{self.name}: All retries failed, trying fallback chain")
-            for fallback in self.fallback_agents:
-                try:
-                    result = fallback.execute(**kwargs)
-                    if result.status == AgentStatus.SUCCESS:
-                        result.status = AgentStatus.FALLBACK
-                        logger.info(f"{self.name}: Fallback {fallback.name} succeeded")
-                        return result
-                except Exception as fb_error:
-                    logger.warning(f"{self.name}: Fallback {fallback.name} failed: {fb_error}")
-
-        # Complete failure
-        execution_time = (time.time() - start_time) * 1000
-        logger.error(f"{self.name}: Complete failure after {self.max_retries} retries")
-
-        return AgentResult(
-            status=AgentStatus.FAILURE,
-            error=last_error or "Unknown error",
-            execution_time_ms=execution_time,
-            retries=self.max_retries,
-            confidence=0.0,
-        )
+            # Return failure result for metrics, but exception will propagate
+            return AgentResult(
+                status=AgentStatus.FAILURE,
+                error=str(e),
+                execution_time_ms=execution_time,
+                retries=0,
+                confidence=0.0,
+            )
 
     @abstractmethod
     def _execute(self, **kwargs) -> Dict[str, Any]:
         """Internal execution logic to be implemented by subclasses.
 
+        Subclasses should:
+        - Use LLMRetryHandler from src.utils.llm_retry for all LLM calls
+        - Raise clear exceptions on failure (NO silent fallbacks)
+        - Return Dict with agent-specific output data on success
+
         Returns:
-            Dict containing agent-specific output data.
+            Dict containing agent-specific output data
 
         Raises:
-            Exception: Any error that should trigger retry logic.
+            LLMValidationError: If LLM output validation fails
+            LLMAPIError: If LLM API calls fail
+            LLMTimeoutError: If LLM timeout
+            Other exceptions: Agent-specific errors
         """
         pass

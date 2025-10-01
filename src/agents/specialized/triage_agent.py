@@ -106,12 +106,7 @@ Analyze the conversation context and current user input to make a routing decisi
 Respond with ONLY valid JSON, no additional text."""
 
     def __init__(self):
-        super().__init__(
-            name="TriageAgent",
-            max_retries=2,
-            retry_delay=0.5,
-            enable_circuit_breaker=True,
-        )
+        super().__init__(name="TriageAgent")
         self.llm = get_gemini_chat(
             model="gemini-2.5-flash",
             temperature=0.1,
@@ -169,59 +164,13 @@ Respond with ONLY valid JSON, no additional text."""
         except json.JSONDecodeError as e:
             logger.error(f"TriageAgent: JSON parse error - {e}")
             logger.debug(f"TriageAgent: Problematic response: {raw_response}")
-            # Fallback to conservative default
-            return self._fallback_decision(state)
+            # Raise clear exception - NO fallback to rules
+            from src.utils.exceptions import TriageError
+            raise TriageError(
+                message=f"Failed to parse triage decision from LLM: {str(e)}",
+                user_action="Please try rephrasing your question or providing more details about your dental concern."
+            ) from e
 
         except Exception as e:
             logger.error(f"TriageAgent: Execution error - {e}")
             raise
-
-    def _fallback_decision(self, state: AgentState) -> Dict[str, Any]:
-        """Provide a safe fallback decision when primary logic fails."""
-        logger.warning("TriageAgent: Using fallback decision")
-
-        # Simple heuristic-based routing
-        if not state.history:
-            # First interaction
-            return {
-                "decision": None,
-                "stage": ConversationStage.GREETING,
-                "action": "greet",
-                "confidence": 0.5,
-                "next_node": "end",
-                "response": "Halo! Saya asisten dental AI SereneAI. Ada keluhan gigi yang bisa saya bantu?",
-                "profile_update": {},
-            }
-        elif state.image_path:
-            # Image present, route to vision
-            return {
-                "decision": None,
-                "stage": ConversationStage.DIAGNOSIS,
-                "action": "yolo",
-                "confidence": 0.7,
-                "next_node": "validator",
-                "response": None,
-                "profile_update": {},
-            }
-        elif len(state.history) >= 3:
-            # Multiple exchanges, likely ready for RAG
-            return {
-                "decision": None,
-                "stage": ConversationStage.DIAGNOSIS,
-                "action": "rag",
-                "confidence": 0.6,
-                "next_node": "summarizer",
-                "response": None,
-                "profile_update": {},
-            }
-        else:
-            # Continue anamnesis
-            return {
-                "decision": None,
-                "stage": ConversationStage.ANAMNESIS,
-                "action": "question",
-                "confidence": 0.5,
-                "next_node": "end",
-                "response": "Bisakah Anda ceritakan lebih detail tentang keluhan giginya?",
-                "profile_update": {},
-            }

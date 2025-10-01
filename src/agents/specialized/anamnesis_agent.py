@@ -134,12 +134,7 @@ class AnamnesisAgent(BaseAgent):
 Respond with ONLY valid JSON."""
 
     def __init__(self):
-        super().__init__(
-            name="AnamnesisAgent",
-            max_retries=2,
-            retry_delay=0.5,
-            enable_circuit_breaker=True,
-        )
+        super().__init__(name="AnamnesisAgent")
         self.llm = get_gemini_chat(
             model="gemini-2.5-flash",
             temperature=0.1,

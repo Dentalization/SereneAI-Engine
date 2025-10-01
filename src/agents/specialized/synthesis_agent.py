@@ -33,12 +33,7 @@ class SynthesisAgent(BaseAgent):
     """Agent for final response assembly and formatting."""
 
     def __init__(self):
-        super().__init__(
-            name="SynthesisAgent",
-            max_retries=1,
-            retry_delay=0.5,
-            enable_circuit_breaker=False,  # Final stage, no circuit breaker
-        )
+        super().__init__(name="SynthesisAgent")
 
     def _execute(self, state: AgentState, **kwargs) -> Dict[str, Any]:
         """Execute response synthesis."""
