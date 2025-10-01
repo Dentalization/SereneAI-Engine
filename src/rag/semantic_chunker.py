@@ -113,7 +113,7 @@ class SemanticChunker:
                 all_chunks.extend(doc_chunks)
 
                 logger.debug(
-                    f"SemanticChunker: Doc {doc_idx} → {len(doc_chunks)} chunks"
+                    f"SemanticChunker: Doc {doc_idx} -> {len(doc_chunks)} chunks"
                 )
 
             except Exception as e:
