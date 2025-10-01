@@ -1,303 +1,407 @@
-"""Agent orchestration using LangGraph.
+"""Multi-agent orchestrator using LangGraph.
 
-This module defines the conversation state and the graph nodes that coordinate
-between prompt orchestration, image analysis, and RAG summarization. Behavior
-remains identical to the original implementation; changes focus on readability
-and maintainability (docstrings, typing, minor structure).
+Features:
+- Specialized agents (Triage, Anamnesis, Vision, RAG, Synthesis)
+- Robust error handling with circuit breakers and fallbacks
+- Conversation state persistence
+- Enhanced state management with Pydantic models
 """
 from __future__ import annotations
 
-import json
 import logging
-import re
-from typing import Any, Dict, List, TypedDict
+from typing import Any, Dict
 
-from langchain_core.output_parsers import JsonOutputParser
-from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import END, StateGraph
 
-from src.config import load_config
-from src.tools.rag_tool import query_rag
-from src.tools.yolo_tool import detect_issues
-from src.utils.llm import get_gemini_chat
+from src.agents.persistence import save_state
+from src.agents.specialized.anamnesis_agent import AnamnesisAgent
+from src.agents.specialized.rag_agent import RAGAgent
+from src.agents.specialized.synthesis_agent import SynthesisAgent
+from src.agents.specialized.triage_agent import TriageAgent
+from src.agents.specialized.vision_agent import VisionAgent
+from src.agents.state_models import AgentState, ConversationStage, MessageRole
 
 logger = logging.getLogger(__name__)
 
-config = load_config()
-
-# Initialize LangChain ChatGoogleGenerativeAI model via utility
-model = get_gemini_chat(
-    model="gemini-2.5-flash",
-    temperature=0.1,
-    convert_system_message_to_human=True,
-)
-
-# JSON output parser for structured responses
-json_parser = JsonOutputParser()
+# Initialize specialized agents
+triage_agent = TriageAgent()
+anamnesis_agent = AnamnesisAgent()
+vision_agent = VisionAgent()
+rag_agent = RAGAgent()
+synthesis_agent = SynthesisAgent()
 
 
-class AgentState(TypedDict):
-    """State passed between graph nodes during a single run."""
+def triage_node(state: AgentState) -> Dict[str, Any]:
+    """Triage node: Classify query and route to appropriate path."""
+    logger.info(f"Orchestrator: Triage node - Input: '{state.input[:50]}...'")
 
-    input: str
-    image_path: str
-    detections: str
-    spatial_insights: str
-    rag_response: str
-    final_response: str
-    sources: List[Dict[str, Any]]
-    history: List[dict]
-    conversation_stage: str
-    user_profile: Dict[str, Any]
-
-
-ORCHESTRATOR_PROMPT = """
-You are the coordinator for a dental chatbot in Indonesia. Analyze full history: {history_str}
-Current input: {input}. Image? {image_flag}. Profile: {profile}.
-
-Reason step-by-step internally:
-1. Stage: 'greeting' for first/casual; 'anamnesis' for symptoms collection; 'diagnosis' if 3+ dental details in profile.
-2. Update profile: Add/extract from input (e.g., symptoms: sakit gigi).
-3. Action: 'greet' = ramah + chief question; 'question' = 1 follow-up (durasi/RPD); 'rag' = advice; 'yolo' = image; 'end' = wrap-up.
-4. Next must be single string: 'end' for greet/question; 'validator' for yolo; 'summarizer' for rag.
-
-Example for question: {{"stage": "anamnesis", "action": "question", "response": "Sudah berapa lama?", "next": "end", "params": {{"profile_update": {{"duration": "2 minggu"}}}}}}
-
-OUTPUT ONLY VALID JSON (no extra text): {{"stage": "str", "action": "str", "response": "str or null", "next": "str", "params": {{"profile_update": {{}}}}}}.
-
-Natural, empathetic, suggest consult.
-"""
-
-
-def image_validator(state: AgentState) -> AgentState:
-    """Validate image input if present; otherwise pass state through."""
-    logger.info("FLOW: Entering image_validator")
-    if state.get("image_path"):
-        try:
-            from src.tools.yolo_tool import validate_image
-
-            validate_image(state["image_path"])
-            logger.info(
-                "FLOW: Image validated successfully for path: %s", state["image_path"]
-            )
-            return {"detections": "Valid, proceeding.", "conversation_stage": "diagnosis"}  # type: ignore[return-value]
-        except Exception as e:  # noqa: BLE001 - bubble as final_response
-            logger.error("FLOW: Image validation failed: %s", str(e))
-            return {"final_response": f"Image error: {str(e)}"}  # type: ignore[return-value]
-    else:
-        logger.debug("FLOW: No image path, skipping validator")
-    return state
-
-
-def yolo_detector(state: AgentState) -> AgentState:
-    """Run YOLO detection and spatial analysis if an image is provided."""
-    logger.info("FLOW: Entering yolo_detector")
-    if state.get("image_path"):
-        try:
-            detections, _, spatial_insights = detect_issues(state["image_path"])
-            state["detections"] = detections
-            state["spatial_insights"] = spatial_insights
-            state["conversation_stage"] = "diagnosis"
-            logger.info(
-                "FLOW: YOLO detections: %s... Spatial: %s...",
-                detections[:100],
-                spatial_insights[:100],
-            )
-            return state
-        except Exception as e:  # noqa: BLE001 - handle gracefully
-            logger.error("FLOW: YOLO detection failed: %s", str(e))
-            return {"final_response": "Detection error."}  # type: ignore[return-value]
-    else:
-        logger.debug("FLOW: No image path, skipping detector")
-    return state
-
-
-def rag_summarizer(state: AgentState) -> Dict[str, Any]:
-    """Generate a RAG summary and return final response + sources."""
-    logger.info("FLOW: Entering rag_summarizer")
-    query = state["input"]
-    detections = state.get("detections", "")
-    spatial_insights = state.get("spatial_insights", "")
-    history = state.get("history", [])
-    profile = state.get("user_profile", {})
-    logger.debug(
-        "FLOW: RAG input - Query: %s, Profile: %s...",
-        query,
-        json.dumps(profile)[:200],
-    )
     try:
-        response, sources = query_rag(query, detections, spatial_insights, history, profile)
-        state["sources"] = sources  # Store for UI
-        logger.info(
-            "FLOW: RAG response generated (length: %d chars, sources: %d)",
-            len(response),
-            len(sources),
-        )
-        return {
-            "final_response": response,
-            "conversation_stage": "diagnosis",
-            "sources": sources,
-        }
-    except Exception as e:  # noqa: BLE001 - safe fallback
-        logger.error("FLOW: RAG summarizer failed: %s", str(e))
-        return {
-            "final_response": "Saya sarankan periksa dokter gigi segera untuk keluhan ini.",
-            "sources": [],
-        }
+        result = triage_agent.execute(state=state)
 
-
-def orchestrator(state: AgentState) -> Dict[str, Any]:
-    """Main policy node that routes to validation, detection, or RAG."""
-    logger.info(
-        "FLOW: Entering orchestrator - Input: %s, Stage: %s",
-        state["input"],
-        state.get("conversation_stage", "unknown"),
-    )
-    history = state.get("history", [])
-    history_str = "\n".join([f"{m['role']}: {m['content']}" for m in history[-5:]])
-    image_flag = "Yes" if state.get("image_path") else "No"
-    profile = state.get("user_profile", {})
-
-    # Create prompt using LangChain ChatPromptTemplate
-    chat_prompt = ChatPromptTemplate.from_messages([("human", ORCHESTRATOR_PROMPT)])
-
-    # Format the prompt with variables
-    formatted_prompt = chat_prompt.format_messages(
-        history_str=history_str,
-        input=state["input"],
-        image_flag=image_flag,
-        profile=json.dumps(profile),
-    )
-
-    logger.debug("GEMINI: Prompt sent (length: %d chars)", len(str(formatted_prompt)))
-    try:
-        # Invoke model with formatted prompt and request JSON output
-        response = model.invoke(
-            formatted_prompt,
-            config={"response_format": {"type": "json_object"}},
-        )
-        raw_response = response.content.strip()
-        logger.info("GEMINI: Raw response: %s", raw_response)
-
-        json_match = re.search(r"\{.*\}", raw_response, re.DOTALL)
-        json_str = json_match.group(0) if json_match else raw_response
-
-        decision = json.loads(json_str)
-        logger.info("GEMINI: Parsed decision: %s", decision)
-
-        state["conversation_stage"] = decision.get("stage", "anamnesis")
-        profile_update = decision.get("params", {}).get("profile_update", {})
-        state["user_profile"] = {**profile, **profile_update}
-        logger.info("FLOW: Profile updated: %s", json.dumps(profile_update))
-
-        if decision["action"] in ["greet", "question"]:
-            state["final_response"] = decision.get(
-                "response", "Ceritakan keluhan gigi Anda?"
-            )
-            state["sources"] = []  # No sources for non-RAG
-            logger.info(
-                "FLOW: Action %s - Response: %s...",
-                decision["action"],
-                state["final_response"][:100],
-            )
-            return {"next": "end", "final_response": state["final_response"], "sources": []}
-        elif decision["action"] == "yolo":
-            logger.info("FLOW: Routing to yolo/validator")
-            return {"next": "validator"}
-        elif decision["action"] == "rag":
-            logger.info("FLOW: Routing to rag/summarizer")
-            return {"next": "summarizer"}
-        else:
-            logger.info("FLOW: Default end action")
+        if result.status.value != "success":
+            logger.error(f"Orchestrator: Triage failed - {result.error}")
+            # Fallback: conservative routing
             return {
-                "next": "end",
-                "final_response": decision.get(
-                    "response", "Terima kasih! Konsultasikan ke dokter gigi ya."
-                ),
-                "sources": [],
+                "conversation_stage": ConversationStage.ANAMNESIS,
+                "next_node": "anamnesis" if not state.image_path else "vision",
+                "confidence_score": 0.5,
             }
 
-    except json.JSONDecodeError as je:
-        logger.error("GEMINI: JSON parse error: %s. Raw: %s", je, raw_response)
+        # Extract decision
+        decision_data = result.data
+        state.conversation_stage = decision_data["stage"]
+        state.confidence_score = decision_data["confidence"]
+        state.triage_decision = decision_data
+
+        # Update profile if needed
+        if decision_data.get("profile_update"):
+            state.update_profile(**decision_data["profile_update"])
+
+        # Handle direct responses (greet, question)
+        action = decision_data["action"]
+        if action in ["greet", "question"] and decision_data.get("response"):
+            state.final_response = decision_data["response"]
+            state.next_node = "end"
+            logger.info(f"Orchestrator: Direct response - {action}")
+            return {"final_response": state.final_response, "next_node": "end"}
+
+        # Route based on action
+        next_node = {
+            "yolo": "vision",
+            "rag": "rag",
+            "question": "anamnesis",
+        }.get(action, "end")
+
+        state.next_node = next_node
+        logger.info(f"Orchestrator: Triage decision - stage={state.conversation_stage}, next={next_node}")
+
         return {
-            "next": "end",
-            "final_response": "Maaf, saya perlu klarifikasi. Apa keluhan gigi utama Anda?",
-            "sources": [],
+            "conversation_stage": state.conversation_stage,
+            "next_node": next_node,
+            "confidence_score": state.confidence_score,
+            "triage_decision": decision_data,
         }
-    except Exception as e:  # noqa: BLE001 - robust fallback
-        logger.error("FLOW: Orchestrator error: %s", str(e))
+
+    except Exception as e:
+        logger.error(f"Orchestrator: Triage node exception - {e}")
         return {
-            "next": "end",
-            "final_response": "Error. Coba lagi dengan cerita keluhan gigi Anda.",
-            "sources": [],
+            "final_response": "Maaf, terjadi kesalahan. Bisakah Anda ulangi pertanyaan?",
+            "next_node": "end",
         }
 
 
-# Graph definition
+def anamnesis_node(state: AgentState) -> Dict[str, Any]:
+    """Anamnesis node: Extract structured symptoms using SOCRATES."""
+    logger.info("Orchestrator: Anamnesis node")
+
+    try:
+        result = anamnesis_agent.execute(state=state)
+
+        if result.status.value != "success":
+            logger.warning(f"Orchestrator: Anamnesis extraction failed - {result.error}")
+            # Continue with partial data
+            return {
+                "final_response": "Bisakah Anda ceritakan lebih detail tentang keluhan Anda?",
+                "next_node": "end",
+            }
+
+        anamnesis_data = result.data
+        state.anamnesis_data = anamnesis_data
+
+        # Update profile with symptoms
+        if anamnesis_data.get("profile_update"):
+            state.update_profile(**anamnesis_data["profile_update"])
+
+        # Check if ready for diagnosis
+        if anamnesis_data.get("ready_for_diagnosis"):
+            logger.info("Orchestrator: Sufficient info collected, routing to RAG")
+            state.next_node = "rag"
+            return {
+                "anamnesis_data": anamnesis_data,
+                "next_node": "rag",
+            }
+        else:
+            # Ask follow-up question
+            suggested_q = anamnesis_data.get("suggested_question", "Ceritakan lebih lanjut?")
+            logger.info("Orchestrator: More info needed, asking follow-up")
+            state.final_response = suggested_q
+            state.next_node = "end"
+            return {
+                "final_response": suggested_q,
+                "anamnesis_data": anamnesis_data,
+                "next_node": "end",
+            }
+
+    except Exception as e:
+        logger.error(f"Orchestrator: Anamnesis node exception - {e}")
+        return {
+            "final_response": "Untuk membantu lebih baik, bisa ceritakan: di mana sakit, sejak kapan, dan seberapa parah (1-10)?",
+            "next_node": "end",
+        }
+
+
+def vision_node(state: AgentState) -> Dict[str, Any]:
+    """Vision node: Analyze dental image with YOLO."""
+    logger.info("Orchestrator: Vision node")
+
+    if not state.image_path:
+        logger.warning("Orchestrator: Vision node called without image, skipping")
+        return {"next_node": "rag"}
+
+    try:
+        result = vision_agent.execute(state=state)
+
+        if result.status.value != "success":
+            logger.error(f"Orchestrator: Vision analysis failed - {result.error}")
+            state.spatial_insights = "Image analysis failed. Please try with a clearer image."
+            return {
+                "spatial_insights": state.spatial_insights,
+                "next_node": "rag",
+            }
+
+        vision_data = result.data
+
+        # Check image quality
+        if not vision_data.get("success", False):
+            # Image quality issues
+            quality = vision_data.get("image_quality")
+            if quality:
+                feedback = (
+                    f"Image quality needs improvement. "
+                    f"Issues: {', '.join(quality.issues)}. "
+                    f"Suggestions: {', '.join(quality.recommendations)}"
+                )
+                state.final_response = feedback
+                state.next_node = "end"
+                return {
+                    "final_response": feedback,
+                    "next_node": "end",
+                }
+
+        # Extract detections and spatial insights
+        state.detections = vision_data.get("detections", [])
+        state.spatial_insights = vision_data.get("spatial_insights", "")
+        state.confidence_score = vision_data.get("confidence", 0.7)
+
+        logger.info(f"Orchestrator: Vision complete - {len(state.detections)} detections")
+
+        # Continue to RAG for evidence-based advice
+        state.next_node = "rag"
+        return {
+            "detections": state.detections,
+            "spatial_insights": state.spatial_insights,
+            "next_node": "rag",
+            "confidence_score": state.confidence_score,
+        }
+
+    except Exception as e:
+        logger.error(f"Orchestrator: Vision node exception - {e}")
+        return {
+            "spatial_insights": "Image processing error occurred.",
+            "next_node": "rag",
+        }
+
+
+def rag_node(state: AgentState) -> Dict[str, Any]:
+    """RAG node: Retrieve evidence and validate response."""
+    logger.info("Orchestrator: RAG node")
+
+    try:
+        result = rag_agent.execute(state=state)
+
+        if result.status.value != "success":
+            logger.error(f"Orchestrator: RAG failed - {result.error}")
+            # Fallback response
+            state.final_response = (
+                "Berdasarkan keluhan Anda, saya sarankan untuk segera berkonsultasi dengan "
+                "dokter gigi untuk pemeriksaan lebih lanjut dan penanganan yang tepat."
+            )
+            state.next_node = "synthesis"
+            return {
+                "rag_response": state.final_response,
+                "next_node": "synthesis",
+            }
+
+        rag_data = result.data
+
+        state.rag_response = rag_data.get("response", "")
+        state.sources = rag_data.get("sources", [])
+        state.confidence_score = rag_data.get("overall_confidence", 0.7)
+
+        logger.info(
+            f"Orchestrator: RAG complete - Confidence={state.confidence_score:.2f}, "
+            f"Sources={len(state.sources)}, Risk={rag_data.get('hallucination_risk', 'unknown')}"
+        )
+
+        # Pass recommendations to synthesis
+        state.next_node = "synthesis"
+        return {
+            "rag_response": state.rag_response,
+            "sources": state.sources,
+            "confidence_score": state.confidence_score,
+            "next_node": "synthesis",
+            "recommendations": rag_data.get("recommendations", []),
+            "claim_validations": rag_data.get("claim_validations", []),
+        }
+
+    except Exception as e:
+        logger.error(f"Orchestrator: RAG node exception - {e}")
+        return {
+            "rag_response": "Untuk keluhan Anda, konsultasi dokter gigi sangat disarankan.",
+            "next_node": "synthesis",
+        }
+
+
+def synthesis_node(state: AgentState) -> Dict[str, Any]:
+    """Synthesis node: Assemble final response with citations."""
+    logger.info("Orchestrator: Synthesis node")
+
+    try:
+        # Collect all data for synthesis
+        synthesis_kwargs = {
+            "rag_response": state.rag_response,
+            "sources": state.sources,
+            "recommendations": state.triage_decision.get("recommendations", []) if state.triage_decision else [],
+            "overall_confidence": state.confidence_score,
+        }
+
+        result = synthesis_agent.execute(state=state, **synthesis_kwargs)
+
+        if result.status.value != "success":
+            logger.warning(f"Orchestrator: Synthesis failed - {result.error}, using RAG response directly")
+            state.final_response = state.rag_response or "Konsultasi dokter gigi direkomendasikan."
+        else:
+            synthesis_data = result.data
+            state.final_response = synthesis_data.get("final_response", state.rag_response)
+
+        # Add message to history
+        state.add_message(MessageRole.ASSISTANT, state.final_response)
+
+        # Save checkpoint
+        save_state(state)
+
+        logger.info(f"Orchestrator: Synthesis complete - Response length: {len(state.final_response)}")
+
+        return {
+            "final_response": state.final_response,
+            "next_node": "end",
+        }
+
+    except Exception as e:
+        logger.error(f"Orchestrator: Synthesis node exception - {e}")
+        return {
+            "final_response": state.rag_response or "Maaf, terjadi kesalahan. Konsultasi dokter gigi disarankan.",
+            "next_node": "end",
+        }
+
+
+# Build LangGraph
 graph = StateGraph(AgentState)
-graph.add_node("validator", image_validator)
-graph.add_node("detector", yolo_detector)
-graph.add_node("summarizer", rag_summarizer)
-graph.add_node("orchestrator", orchestrator)
 
-graph.set_entry_point("orchestrator")
+# Add nodes
+graph.add_node("triage", triage_node)
+graph.add_node("anamnesis", anamnesis_node)
+graph.add_node("vision", vision_node)
+graph.add_node("rag", rag_node)
+graph.add_node("synthesis", synthesis_node)
+
+# Set entry point
+graph.set_entry_point("triage")
+
+# Add conditional routing from triage
 graph.add_conditional_edges(
-    "orchestrator",
-    lambda s: s.get("next", "end"),
+    "triage",
+    lambda s: s.next_node,
     {
-        "validator": "validator",
-        "detector": "detector",
-        "summarizer": "summarizer",
+        "anamnesis": "anamnesis",
+        "vision": "vision",
+        "rag": "rag",
         "end": END,
     },
 )
-graph.add_edge("validator", "detector")
-graph.add_edge("detector", "summarizer")
-graph.add_edge("summarizer", END)
 
+# Anamnesis can go to RAG or END (more questions)
+graph.add_conditional_edges(
+    "anamnesis",
+    lambda s: s.next_node,
+    {
+        "rag": "rag",
+        "end": END,
+    },
+)
+
+# Vision always goes to RAG (for evidence-based interpretation)
+graph.add_edge("vision", "rag")
+
+# RAG goes to synthesis
+graph.add_edge("rag", "synthesis")
+
+# Synthesis is terminal
+graph.add_edge("synthesis", END)
+
+# Compile graph
 app = graph.compile()
 
 
-def run_agent(input_text: str, image_path: str | None = None, history: List[dict] | None = None) -> Dict[str, Any]:
-    """Public entrypoint used by the UI to run a single agent turn.
+def run_agent(
+    input_text: str,
+    image_path: str | None = None,
+    history: list[dict] | None = None,
+    conversation_id: str | None = None,
+) -> Dict[str, Any]:
+    """Run multi-agent orchestration for dental chatbot.
 
     Args:
-        input_text: User input text.
-        image_path: Optional path to an image for analysis.
-        history: Prior messages for context.
+        input_text: User input text
+        image_path: Optional path to dental image
+        history: Prior conversation messages
+        conversation_id: Optional ID to resume conversation
 
     Returns:
-        Dict with keys 'response' and 'sources'.
+        Dict with 'response', 'sources', 'confidence', 'conversation_id'
     """
-    logger.info(
-        "AGENT: Starting run - Input: %s, Image: %s, History len: %d",
-        input_text,
-        image_path,
-        len(history or []),
+    logger.info(f"Orchestrator: Starting run - Input: '{input_text[:50]}...', Image: {bool(image_path)}")
+
+    # Initialize state
+    from src.agents.state_models import ChatMessage
+
+    state = AgentState(
+        input=input_text,
+        image_path=image_path or "",
+        conversation_id=conversation_id or f"conv_{int(__import__('time').time())}",
     )
-    state: AgentState = {
-        "input": input_text,
-        "image_path": image_path or "",
-        "history": history or [],
-        "conversation_stage": "greeting",
-        "user_profile": {},
-        "sources": [],  # Initial
-    }
+
+    # Restore history if provided
+    if history:
+        for msg in history:
+            role = MessageRole(msg.get("role", "user"))
+            content = msg.get("content", "")
+            state.add_message(role, content)
+
     try:
+        # Run graph
         result = app.invoke(state)
-        response = result.get("final_response", "Error occurred.")
-        sources = result.get("sources", [])
+
+        response = result.final_response or "Maaf, terjadi kesalahan."
+        sources = result.sources or []
+
         logger.info(
-            "AGENT: Run complete - Response length: %d, Sources: %d (breakdown: PDF %d, PubMed %d)",
-            len(response),
-            len(sources),
-            len([s for s in sources if "PDF" in s.get("source", "")]),
-            len([s for s in sources if "PubMed" in s.get("source", "")]),
+            f"Orchestrator: Run complete - Response: {len(response)} chars, "
+            f"Sources: {len(sources)}, Confidence: {result.confidence_score:.2f}"
         )
-        return {"response": response, "sources": sources}
-    except Exception as e:  # noqa: BLE001 - user-facing fallback
-        logger.error("AGENT: Run failed: %s", str(e))
+
         return {
-            "response": "Maaf, ada kesalahan teknis. Coba ulangi pertanyaan Anda.",
+            "response": response,
+            "sources": [src.model_dump() if hasattr(src, 'model_dump') else src for src in sources],
+            "confidence": result.confidence_score,
+            "conversation_id": result.conversation_id,
+        }
+
+    except Exception as e:
+        logger.error(f"Orchestrator: Run failed - {e}")
+        return {
+            "response": "Maaf, ada kesalahan teknis. Coba lagi atau konsultasi dokter gigi.",
             "sources": [],
+            "confidence": 0.0,
+            "conversation_id": state.conversation_id,
         }

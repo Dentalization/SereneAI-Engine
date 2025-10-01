@@ -49,13 +49,14 @@ def warmup_resources() -> bool:
         try:
             logging.info("WARMUP: Starting background warmup")
             # Lazy imports to avoid overhead on module import
-            from src.tools.rag_tool import setup_rag
+            from src.rag import RAGSystem
             from src.tools.yolo_tool import load_yolo_model
             from src.utils.llm import get_gemini_chat
             from langchain_core.messages import HumanMessage
 
             # Preload vectorstore/KG
-            setup_rag()
+            rag_system = RAGSystem()
+            rag_system.setup()
             # Preload YOLO
             load_yolo_model()
             # Prewarm Gemini
