@@ -197,12 +197,60 @@ class AgentState(BaseModel):
         return "\n".join([f"{msg.role.value}: {msg.content}" for msg in recent])
 
     def update_profile(self, **kwargs) -> None:
-        """Update user profile fields with safe serialization."""
+        """Update user profile fields with deep merge for symptoms."""
+        import logging
+        logger = logging.getLogger(__name__)
+
         for key, value in kwargs.items():
             if hasattr(self.user_profile, key):
-                # Special handling for symptoms/SOCRATES profile
+                # Special handling for symptoms/SOCRATES profile - DEEP MERGE
                 if key == "symptoms" and isinstance(value, dict):
-                    value = SOCRATESProfile.from_dict(value)
+                    # Get existing symptoms as dict
+                    current_symptoms = self.user_profile.symptoms.model_dump()
+                    logger.debug(f"StateModel: BEFORE merge - {current_symptoms}")
+
+                    # Deep merge: update only non-None fields, preserve existing
+                    for symptom_key, symptom_value in value.items():
+                        if symptom_key in SOCRATESProfile.model_fields:
+                            # Skip None values - don't overwrite existing with None
+                            if symptom_value is None:
+                                logger.debug(f"StateModel: Skipping None value for '{symptom_key}'")
+                                continue
+
+                            # Handle list fields (associations, exacerbating_factors, relieving_factors)
+                            list_fields = ['associations', 'exacerbating_factors', 'relieving_factors']
+                            if symptom_key in list_fields:
+                                # Convert string to list if needed
+                                if isinstance(symptom_value, str):
+                                    # Split by comma or convert to single-item list
+                                    symptom_value = [item.strip() for item in symptom_value.split(',')]
+                                    logger.debug(f"StateModel: Converted string to list for '{symptom_key}': {symptom_value}")
+
+                                if isinstance(symptom_value, list):
+                                    existing = current_symptoms.get(symptom_key, [])
+                                    if isinstance(existing, list):
+                                        # Merge lists, avoid duplicates
+                                        merged = list(set(existing + symptom_value))
+                                        current_symptoms[symptom_key] = merged
+                                        logger.debug(f"StateModel: Merged list '{symptom_key}': {existing} + {symptom_value} = {merged}")
+                                    else:
+                                        current_symptoms[symptom_key] = symptom_value
+                            else:
+                                # Update scalar values (site, onset, character, etc.)
+                                old_value = current_symptoms.get(symptom_key)
+
+                                # Special handling for severity - must be int 1-10
+                                if symptom_key == 'severity' and isinstance(symptom_value, str):
+                                    logger.warning(f"StateModel: LLM sent invalid severity '{symptom_value}' (string instead of int) - skipping")
+                                    continue
+
+                                current_symptoms[symptom_key] = symptom_value
+                                logger.debug(f"StateModel: Updated '{symptom_key}': {old_value} -> {symptom_value}")
+
+                    logger.debug(f"StateModel: AFTER merge - {current_symptoms}")
+                    # Create new SOCRATESProfile with merged data
+                    value = SOCRATESProfile(**current_symptoms)
+
                 setattr(self.user_profile, key, value)
         self.user_profile.last_updated = datetime.now()
 

@@ -62,7 +62,12 @@ def triage_node(state: AgentState) -> Dict[str, Any]:
         state.final_response = decision_data["response"]
         state.next_node = "end"
         logger.info(f"Orchestrator: Direct response - {action}")
-        return {"final_response": state.final_response, "next_node": "end"}
+        # CRITICAL: Return user_profile to persist changes to state
+        return {
+            "final_response": state.final_response,
+            "next_node": "end",
+            "user_profile": state.user_profile,
+        }
 
     # Route based on action
     next_node = {
@@ -74,11 +79,13 @@ def triage_node(state: AgentState) -> Dict[str, Any]:
     state.next_node = next_node
     logger.info(f"Orchestrator: Triage decision - stage={state.conversation_stage}, next={next_node}")
 
+    # CRITICAL: Return user_profile to persist changes to state
     return {
         "conversation_stage": state.conversation_stage,
         "next_node": next_node,
         "confidence_score": state.confidence_score,
         "triage_decision": decision_data,
+        "user_profile": state.user_profile,
     }
 
 
@@ -111,6 +118,7 @@ def anamnesis_node(state: AgentState) -> Dict[str, Any]:
         return {
             "anamnesis_data": anamnesis_data,
             "next_node": "rag",
+            "user_profile": state.user_profile,
         }
     else:
         # Ask follow-up question
@@ -129,6 +137,7 @@ def anamnesis_node(state: AgentState) -> Dict[str, Any]:
             "final_response": suggested_q,
             "anamnesis_data": anamnesis_data,
             "next_node": "end",
+            "user_profile": state.user_profile,
         }
 
 
@@ -368,15 +377,34 @@ def run_agent(
 
     # Initialize state
     from src.agents.state_models import ChatMessage
+    from src.agents.persistence import load_state, save_state
 
-    state = AgentState(
-        input=input_text,
-        image_path=image_path or "",
-        conversation_id=conversation_id or f"conv_{int(__import__('time').time())}",
-    )
+    # Try to load existing state if conversation_id provided
+    if conversation_id:
+        loaded_state = load_state(conversation_id)
+        if loaded_state:
+            logger.info(f"Orchestrator: Resumed conversation {conversation_id} - {len(loaded_state.history)} messages, user_profile preserved")
+            state = loaded_state
+            # Update with new input
+            state.input = input_text
+            state.image_path = image_path or ""
+        else:
+            logger.info(f"Orchestrator: No checkpoint found for {conversation_id}, starting fresh")
+            state = AgentState(
+                input=input_text,
+                image_path=image_path or "",
+                conversation_id=conversation_id,
+            )
+    else:
+        # New conversation
+        state = AgentState(
+            input=input_text,
+            image_path=image_path or "",
+            conversation_id=f"conv_{int(__import__('time').time())}",
+        )
 
-    # Restore history if provided
-    if history:
+    # Restore history if provided (for UI compatibility)
+    if history and not conversation_id:  # Only if not already loaded from checkpoint
         for msg in history:
             role = MessageRole(msg.get("role", "user"))
             content = msg.get("content", "")
@@ -394,6 +422,18 @@ def run_agent(
     sources = result.get("sources", [])
     confidence = result.get("confidence_score", 0.0)
     conversation_id = result.get("conversation_id", state.conversation_id)
+
+    # Update state with result
+    if isinstance(result, dict):
+        # Apply updates from result to state
+        if "user_profile" in result:
+            state.user_profile = result["user_profile"]
+        state.final_response = response
+        state.confidence_score = confidence
+
+    # Save state for next interaction
+    save_state(state)
+    logger.debug(f"Orchestrator: Saved checkpoint for {conversation_id}")
 
     logger.info(
         f"Orchestrator: Run complete - Response: {len(response)} chars, "

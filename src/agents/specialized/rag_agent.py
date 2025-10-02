@@ -157,17 +157,17 @@ class RAGAgent(BaseAgent):
             parts.append(f"Chief Complaint: {state.user_profile.chief_complaint}")
 
         # Add SOCRATES symptoms
-        socrates = state.user_profile.socrates
-        if socrates.site:
-            parts.append(f"Location: {socrates.site}")
-        if socrates.character:
-            parts.append(f"Type: {socrates.character}")
-        if socrates.severity:
-            parts.append(f"Severity: {socrates.severity}/10")
-        if socrates.onset:
-            parts.append(f"Started: {socrates.onset}")
-        if socrates.time_course:
-            parts.append(f"Progression: {socrates.time_course}")
+        symptoms = state.user_profile.symptoms
+        if symptoms.site:
+            parts.append(f"Location: {symptoms.site}")
+        if symptoms.character:
+            parts.append(f"Type: {symptoms.character}")
+        if symptoms.severity:
+            parts.append(f"Severity: {symptoms.severity}/10")
+        if symptoms.onset:
+            parts.append(f"Started: {symptoms.onset}")
+        if symptoms.time_course:
+            parts.append(f"Progression: {symptoms.time_course}")
 
         # Add current query
         parts.append(f"Query: {state.input}")

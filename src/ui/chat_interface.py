@@ -125,6 +125,11 @@ def render_chat_interface(config: Dict[str, Any]) -> None:
         st.session_state.messages = []
         logging.info("UI: New session - messages initialized")
 
+    if "conversation_id" not in st.session_state:
+        import time
+        st.session_state.conversation_id = f"conv_{int(time.time())}"
+        logging.info(f"UI: New conversation_id - {st.session_state.conversation_id}")
+
     # Replay history
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
@@ -186,10 +191,13 @@ def render_chat_interface(config: Dict[str, Any]) -> None:
             try:
                 with st.spinner("Processing..."):
                     logging.info(
-                        f"UI: Calling run_agent - Text: '{user_text}', Image: {image_path}, History len: {len(st.session_state.messages[:-1])}"
+                        f"UI: Calling run_agent - Text: '{user_text}', Image: {image_path}, History len: {len(st.session_state.messages[:-1])}, ConvID: {st.session_state.conversation_id}"
                     )
                     full_result = run_agent(
-                        user_text, image_path, st.session_state.messages[:-1]
+                        user_text,
+                        image_path,
+                        st.session_state.messages[:-1],
+                        st.session_state.conversation_id  # Pass conversation_id for state persistence
                     )  # Dict: {'response', 'sources'}
                     response = full_result["response"]
                     sources = full_result.get("sources", [])
