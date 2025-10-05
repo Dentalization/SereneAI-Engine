@@ -66,22 +66,22 @@ Examples:
     parser.add_argument(
         "--embedding-model",
         type=str,
-        default="sentence-transformers/all-MiniLM-L6-v2",
-        help="Embedding model to use (default: all-MiniLM-L6-v2)"
+        default="NeuML/pubmedbert-base-embeddings",
+        help="Embedding model to use (default: pubmedbert-base-embeddings)"
     )
 
     parser.add_argument(
         "--index-dir",
         type=str,
-        default=".rag/faiss_index",
-        help="Directory to save FAISS index (default: .rag/faiss_index)"
+        default="rag/faiss_index",
+        help="Directory to save FAISS index (default: rag/faiss_index)"
     )
 
     parser.add_argument(
         "--kg-path",
         type=str,
-        default=".rag/kg.pkl",
-        help="Path to save knowledge graph (default: .rag/kg.pkl)"
+        default="rag/kg.pkl",
+        help="Path to save knowledge graph (default: rag/kg.pkl)"
     )
 
     return parser.parse_args()

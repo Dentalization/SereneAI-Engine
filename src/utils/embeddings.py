@@ -20,7 +20,7 @@ from sentence_transformers import SentenceTransformer
 logger = logging.getLogger(__name__)
 
 # Default model name (can be overridden via config)
-DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+DEFAULT_EMBEDDING_MODEL = "NeuML/pubmedbert-base-embeddings"
 
 
 @lru_cache(maxsize=1)
